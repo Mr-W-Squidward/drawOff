@@ -9,7 +9,6 @@ function chooseRandomWord(words: string[]): string {
   return words[randomNumber];
 } 
 
-
 export default function App() {
   const brushColourRef = useRef("black");
   const canvasLeftRef = useRef<HTMLCanvasElement>(null);
@@ -19,42 +18,64 @@ export default function App() {
     brushColourRef.current = brushColour;
   }
 
-
+  // Canvas drawing refs -> add line width / colour wheel / socket.io later
   useEffect(() => {
-    const canvas = canvasLeftRef.current;
-    if (!canvas) throw new Error('Could not load canvas')
-    const ctx = canvas.getContext('2d');
+    const setupCanvas = (canvas: HTMLCanvasElement | null) => {
+      if (!canvas) throw new Error('Could not load canvas')
+      const ctx = canvas.getContext('2d');
 
-    canvas.width = canvas.offsetWidth;
-    canvas.height = canvas.offsetHeight;
+      const resizeCanvas = () => {
+        canvas.width = canvas.offsetWidth;
+        canvas.height = canvas.offsetHeight;
+      };
 
-    const updateRect = () => canvas.getBoundingClientRect();
-    let rect = updateRect();
-    const isDrawing = { current: false };
+      resizeCanvas();
 
-    const onMouseDown = (event: MouseEvent) => {
-      rect = updateRect();
-      isDrawing.current = true;
-      if (ctx) ctx.strokeStyle = brushColourRef.current;
-      ctx?.beginPath();
-      ctx?.moveTo(event.clientX - rect.left, event.clientY - rect.top);
+      let rect = canvas.getBoundingClientRect();
+      const isDrawing = { current: false }
+
+      const onMouseDown = (event: MouseEvent) => {
+        rect = canvas.getBoundingClientRect();
+        isDrawing.current = true;
+        if (!ctx) return;
+        ctx.strokeStyle = brushColourRef.current;
+        ctx.beginPath();
+        ctx.moveTo(event.clientX - rect.left, event.clientY - rect.top);
+      };
+
+      const onMouseMove = (event: MouseEvent) => {
+        if (!isDrawing.current || !ctx) return;
+        ctx.lineTo(event.clientX - rect.left, event.clientY - rect.top);
+        ctx.stroke();
+      }
+
+      const stopDrawing = () => {
+        isDrawing.current = false;
+      }
+      
+      canvas.addEventListener("mousedown", onMouseDown);
+      canvas.addEventListener("mousemove", onMouseMove);
+      canvas.addEventListener('mouseup', stopDrawing);
+      canvas.addEventListener('mouseleave', stopDrawing);
+      window.addEventListener('resize', resizeCanvas);
+
+      return () => {
+        canvas.removeEventListener("mousedown", onMouseDown);
+        canvas.removeEventListener("mousemove", onMouseMove);
+        canvas.removeEventListener('mouseup', stopDrawing);
+        canvas.removeEventListener('mouseleave', stopDrawing);
+        window.removeEventListener('resize', resizeCanvas);
+      }
     };
 
-    const onMouseMove = (event: MouseEvent) => {
-      if (!isDrawing.current) return;
-      ctx?.lineTo(event.clientX - rect.left, event.clientY - rect.top);
-      ctx?.stroke();
-    }
-    
-    canvas.addEventListener("mousedown", onMouseDown);
-    canvas.addEventListener("mousemove", onMouseMove);
-    canvas.addEventListener('mouseup', () => isDrawing.current = false );
-    canvas.addEventListener('mouseleave', () => isDrawing.current = false );
+    const cleanupLeft = setupCanvas(canvasLeftRef.current);
+    const cleanupRight = setupCanvas(canvasRightRef.current);
 
     return () => {
-      canvas.removeEventListener("mousedown", onMouseDown);
-      canvas.removeEventListener("mousemove", onMouseMove);
-    }}, []);
+      cleanupLeft();
+      cleanupRight();
+    };
+  }, []);
 
   return (
     <>
