@@ -1,5 +1,18 @@
 import { useRef, useEffect, useState } from "react";
 
+type Stroke = {
+  type: 'brush' | 'eraser';
+  colour: string;
+  width: number;
+  points: Array<{ x: number, y: number }>
+};
+
+type CanvasState = {
+  history: Stroke[]
+  historyIndex: number;
+  currentTool: 'brush' | 'eraser';
+};
+
 const wordList = ["Bunny", "Sunflower", "Lavender Roses", "Glasses", "Sudoku",
     "Birthday Cake", "Bear", "Bird", "Sunset and Mountain Landscape", "Galaxy", "Cutie", "Tung Tung Tung Sahur", "Tuff signature"
 ];
@@ -14,9 +27,62 @@ export default function App() {
   const lineWidthRef = useRef(4);
   const canvasLeftRef = useRef<HTMLCanvasElement>(null);
   const canvasRightRef = useRef<HTMLCanvasElement>(null);
+  const canvasStateLeftRef = useRef<CanvasState>({ history: [], historyIndex: -1, currentTool: 'brush' })
+  const canvasStateRightRef = useRef<CanvasState>({ history: [], historyIndex: -1, currentTool: 'brush' })
   const [leftVotes, setLeftVotes] = useState(0);
   const [rightVotes, setRightVotes] = useState(0);
   const [showColourWheel, setShowColourWheel] = useState(false);
+  const [eraserSelected, setEraserSelected] = useState(false)
+  const [, forceUpdate] = useState({});
+
+  function redrawCanvas(canvas: HTMLCanvasElement, strokes: Stroke[], upToIndex: number) {
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return
+
+    // CLEAR
+    ctx.fillStyle = canvas.id === 'canvasLeft' ? '#123123' : "521312"
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+
+    // REDRAW / REDO
+    for (let i = 0; i <= upToIndex && i < strokes.length; i++) {
+      const stroke = strokes[i]
+      ctx.lineWidth = stroke.width;
+      ctx.lineCap = 'round';
+
+      if (stroke.type === 'brush') {
+        ctx.globalCompositeOperation = 'source-over'
+        ctx.strokeStyle = stroke.colour;
+        ctx.beginPath();
+        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+        
+        for (let j = 0; j < stroke.points.length; j++) {
+          ctx.lineTo(stroke.points[j].x, stroke.points[j].y)
+        };
+
+        ctx.stroke();
+      } else if (stroke.type === 'eraser') {
+        ctx.globalCompositeOperation = 'destination-out'
+        ctx.strokeStyle = 'rgb(255, 255, 255)'
+        ctx.beginPath();
+        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+        
+        for (let k = 0; k < stroke.points.length; k++) {
+          ctx.lineTo(stroke.points[k].x, stroke.points[k].y)
+        };
+      }
+
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+
+  function undoStroke(canvasRef: React.RefObject<HTMLCanvasElement>, stateRef: React.RefObject<CanvasState>) {
+    if (stateRef.current.historyIndex > 0) {
+      stateRef.current.historyIndex--;
+      redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex)
+      forceUpdate({});
+    }
+  }
 
   function changeColour(brushColour: string) {
     brushColourRef.current = brushColour;
@@ -69,6 +135,7 @@ export default function App() {
       canvas.addEventListener("mousemove", onMouseMove);
       canvas.addEventListener('mouseup', stopDrawing);
       canvas.addEventListener('mouseleave', stopDrawing);
+      canvas.addEventListener('contextmenu', (event) => event.preventDefault())
       window.addEventListener('resize', resizeCanvas);
 
       return () => {
