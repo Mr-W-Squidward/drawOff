@@ -1,26 +1,7 @@
-import { useRef, useEffect, useState } from "react";
-
-type Stroke = {
-  type: 'brush' | 'eraser';
-  colour: string;
-  width: number;
-  points: Array<{ x: number, y: number }>
-};
-
-type CanvasState = {
-  history: Stroke[]
-  historyIndex: number;
-  currentTool: 'brush' | 'eraser';
-};
-
-const wordList = ["Bunny", "Sunflower", "Lavender Roses", "Glasses", "Sudoku",
-    "Birthday Cake", "Bear", "Bird", "Sunset and Mountain Landscape", "Galaxy", "Cutie", "Tung Tung Tung Sahur", "Tuff signature"
-];
-
-function chooseRandomWord(words: string[]): string {
-  const randomNumber = Math.floor(Math.random() * words.length)
-  return words[randomNumber];
-} 
+import React, { useRef, useEffect, useState } from "react";
+import type { Tool, Stroke, CanvasState } from './types/canvas.types';
+import { redrawCanvas } from './utils/canvasUtils'
+import wordList, { chooseRandomWord } from './constants/constants'
 
 export default function App() {
   const brushColourRef = useRef("black");
@@ -35,53 +16,22 @@ export default function App() {
   const [eraserSelected, setEraserSelected] = useState(false)
   const [, forceUpdate] = useState({});
 
-  function redrawCanvas(canvas: HTMLCanvasElement, strokes: Stroke[], upToIndex: number) {
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return
-
-    // CLEAR
-    ctx.fillStyle = canvas.id === 'canvasLeft' ? '#123123' : "521312"
-    ctx.fillRect(0, 0, canvas.width, canvas.height)
-
-    // REDRAW / REDO
-    for (let i = 0; i <= upToIndex && i < strokes.length; i++) {
-      const stroke = strokes[i]
-      ctx.lineWidth = stroke.width;
-      ctx.lineCap = 'round';
-
-      if (stroke.type === 'brush') {
-        ctx.globalCompositeOperation = 'source-over'
-        ctx.strokeStyle = stroke.colour;
-        ctx.beginPath();
-        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
-        
-        for (let j = 0; j < stroke.points.length; j++) {
-          ctx.lineTo(stroke.points[j].x, stroke.points[j].y)
-        };
-
-        ctx.stroke();
-      } else if (stroke.type === 'eraser') {
-        ctx.globalCompositeOperation = 'destination-out'
-        ctx.strokeStyle = 'rgb(255, 255, 255)'
-        ctx.beginPath();
-        ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
-        
-        for (let k = 0; k < stroke.points.length; k++) {
-          ctx.lineTo(stroke.points[k].x, stroke.points[k].y)
-        };
-      }
-
-      ctx.globalCompositeOperation = 'source-over';
+  function undoStroke(canvasRef: React.RefObject<HTMLCanvasElement | null>, stateRef: React.RefObject<CanvasState>) {
+    if (!canvasRef.current) return;
+    if (stateRef.current.historyIndex >= 0) {
+        stateRef.current.historyIndex--;
+        redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex)
+        forceUpdate({});
     }
   }
 
-  function undoStroke(canvasRef: React.RefObject<HTMLCanvasElement>, stateRef: React.RefObject<CanvasState>) {
-    if (stateRef.current.historyIndex > 0) {
-      stateRef.current.historyIndex--;
+  function redoStroke(canvasRef: React.RefObject<HTMLCanvasElement | null>, stateRef: React.RefObject<CanvasState>) {
+    if (!canvasRef.current) return;
+    if (stateRef.current.historyIndex + 1 < stateRef.current.history.length) {
+      stateRef.current.historyIndex++;
       redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex)
       forceUpdate({});
-    }
+    } 
   }
 
   function changeColour(brushColour: string) {
@@ -96,8 +46,30 @@ export default function App() {
 
   // Canvas drawing refs -> add line width / colour wheel / socket.io later
   const [selectedWord] = useState(() => chooseRandomWord(wordList));
+  
   useEffect(() => {
-    const setupCanvas = (canvas: HTMLCanvasElement | null) => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key === 'z') {
+          e.preventDefault()
+          undoStroke(canvasLeftRef, canvasStateLeftRef);
+          undoStroke(canvasRightRef, canvasStateRightRef);
+        };
+
+        if (e.key === 'y') {
+          e.preventDefault()
+          redoStroke(canvasLeftRef, canvasStateLeftRef);
+          redoStroke(canvasRightRef, canvasStateRightRef);
+        };
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, []);
+  
+  useEffect(() => {
+    const setupCanvas = (canvas: HTMLCanvasElement | null, stateRef: React.RefObject<CanvasState>) => {
       if (!canvas) throw new Error('Could not load canvas')
       const ctx = canvas.getContext('2d');
 
@@ -111,31 +83,84 @@ export default function App() {
       let rect = canvas.getBoundingClientRect();
       const isDrawing = { current: false }
 
+      let currentStroke: Stroke | null = null;
+
       const onMouseDown = (event: MouseEvent) => {
+        // Determine tool based on mouse button
+        const isRightClick = event.button === 2;
+        const toolToUse = isRightClick ? 'eraser' : 'brush';
+        
         rect = canvas.getBoundingClientRect();
         isDrawing.current = true;
         if (!ctx) return;
-        ctx.strokeStyle = brushColourRef.current;
+        
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        
+        currentStroke = {
+          type: toolToUse,
+          colour: brushColourRef.current,
+          width: lineWidthRef.current,
+          points: [{ x, y }]
+        };
+        
+        if (toolToUse === 'eraser') {
+          ctx.globalCompositeOperation = 'destination-out';
+          ctx.strokeStyle = canvas.id === 'canvasLeft' ? '#123123' : '#521312';
+          setEraserSelected(true);
+        } else {
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.strokeStyle = brushColourRef.current;
+          setEraserSelected(false);
+        }
+        
         ctx.lineWidth = lineWidthRef.current;
+        ctx.lineCap = 'round';
         ctx.beginPath();
-        ctx.moveTo(event.clientX - rect.left, event.clientY - rect.top);
+        ctx.moveTo(x, y);
       };
 
+      const onContextMenu = (event: MouseEvent) => {
+        event.preventDefault()
+      }
+
       const onMouseMove = (event: MouseEvent) => {
-        if (!isDrawing.current || !ctx) return;
-        ctx.lineTo(event.clientX - rect.left, event.clientY - rect.top);
+        if (!isDrawing.current || !ctx || !currentStroke) return;
+        
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        
+        currentStroke.points.push({ x, y });
+        ctx.lineTo(x, y);
         ctx.stroke();
       }
 
       const stopDrawing = () => {
+        if (!isDrawing.current || !currentStroke) {
+          isDrawing.current = false;
+          return;
+        }
+        
         isDrawing.current = false;
+
+        // Remove any redo history (when drawn)
+        stateRef.current.history = stateRef.current.history.slice(0, stateRef.current.historyIndex+1);
+
+        // Add stroke to history
+        stateRef.current.history.push(currentStroke);
+        stateRef.current.historyIndex += 1;
+
+        currentStroke = null;
+        
+        // Reset eraser on mouse release
+        setEraserSelected(false);
       }
       
       canvas.addEventListener("mousedown", onMouseDown);
       canvas.addEventListener("mousemove", onMouseMove);
       canvas.addEventListener('mouseup', stopDrawing);
       canvas.addEventListener('mouseleave', stopDrawing);
-      canvas.addEventListener('contextmenu', (event) => event.preventDefault())
+      canvas.addEventListener('contextmenu', onContextMenu)
       window.addEventListener('resize', resizeCanvas);
 
       return () => {
@@ -143,12 +168,13 @@ export default function App() {
         canvas.removeEventListener("mousemove", onMouseMove);
         canvas.removeEventListener('mouseup', stopDrawing);
         canvas.removeEventListener('mouseleave', stopDrawing);
+        canvas.removeEventListener('contextmenu', onContextMenu)
         window.removeEventListener('resize', resizeCanvas);
       }
     };
 
-    const cleanupLeft = setupCanvas(canvasLeftRef.current);
-    const cleanupRight = setupCanvas(canvasRightRef.current);
+    const cleanupLeft = setupCanvas(canvasLeftRef.current, canvasStateLeftRef);
+    const cleanupRight = setupCanvas(canvasRightRef.current, canvasStateRightRef);
 
     return () => {
       cleanupLeft();
