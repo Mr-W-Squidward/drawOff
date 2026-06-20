@@ -51,6 +51,7 @@ export default function App() {
   
   // Canvas drawing refs -> add line width / colour wheel / socket.io later
   const [selectedWord] = useState(() => chooseRandomWord(wordList));
+  const roomIdRef = useRef<string | null>(null);
 
   // Drawing with SOCKET.IO
   useEffect(() => {
@@ -58,52 +59,71 @@ export default function App() {
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      console.log('Connected to server: ', socket.id)
+      console.log('✅ Connected to server:', socket.id);
 
-      const room = `game_${123123}`;
+      const room = `game_${123123}`; // random number later (Math.floor(Math.random() * 100000))
+      roomIdRef.current = room;
       setRoomId(room);
-      socket.emit('join_room', room)
+      socket.emit('join_room', room);
     });
 
     socket.on('player_side_assigned', (side: 'left' | 'right') => {
+      console.log('🎯 player_side_assigned received:', side);
       playerSideRef.current = side;
+      forceUpdate({});
     });
 
-    socket.on('opponent_draw', (stroke: Stroke) => {
-      const stateRef = playerSideRef.current === 'left' ? canvasStateRightRef : canvasStateLeftRef;
-      const canvasRef = playerSideRef.current === 'left' ? canvasRightRef : canvasLeftRef;
+    socket.on('opponent_draw', (data: {side: 'left' | 'right'; stroke: Stroke }) => {
+      console.log('🎨 opponent_draw received, player side:', playerSideRef.current);
+      const stateRef = data.side === 'left' ? canvasStateLeftRef : canvasStateRightRef;
+      const canvasRef = data.side === 'left' ? canvasLeftRef : canvasRightRef;
 
       // STROKE goes to OPPONENT'S history
-      stateRef.current.history.push(stroke);
+      stateRef.current.history = stateRef.current.history.slice(0, stateRef.current.historyIndex+1);
+      stateRef.current.history.push(data.stroke);
       stateRef.current.historyIndex += 1;
       
       if (canvasRef.current) {
         redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex);
-      };
-
-      socket.on('disconnect' , () => {
-        console.log("Disconnected from server");
-      });
-
-      return () => {
-        socket.disconnect();
       }
-    })
-  }, [])
+    });
+
+    socket.on('disconnect', () => {
+      console.log('❌ Disconnected from server');
+    });
+
+    socket.on('connect_error', (error) => {
+      console.error('❌ Connection error:', error);
+    });
+
+    return () => {
+      // Reload persistence
+      localStorage.setItem('canvasStateLeft', JSON.stringify(canvasStateLeftRef.current));
+      localStorage.setItem('canvasStateRight', JSON.stringify(canvasStateRightRef.current));
+      socket.disconnect();
+    };
+  }, []);
   
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey || e.metaKey) {
         if (e.key === 'z') {
           e.preventDefault()
-          undoStroke(canvasLeftRef, canvasStateLeftRef);
-          undoStroke(canvasRightRef, canvasStateRightRef);
+          
+          if (playerSideRef.current === 'left') {
+            undoStroke(canvasLeftRef, canvasStateLeftRef);
+          } else {
+            undoStroke(canvasRightRef, canvasStateRightRef);
+          }
         };
 
         if (e.key === 'y') {
           e.preventDefault()
-          redoStroke(canvasLeftRef, canvasStateLeftRef);
-          redoStroke(canvasRightRef, canvasStateRightRef);
+          if (playerSideRef.current === 'left') {
+            redoStroke(canvasLeftRef, canvasStateLeftRef);
+          } else {
+            redoStroke(canvasRightRef, canvasStateRightRef);
+          }
         };
       }
     }
@@ -113,25 +133,48 @@ export default function App() {
   }, []);
   
   useEffect(() => {
-    const setupCanvas = (canvas: HTMLCanvasElement | null, stateRef: React.RefObject<CanvasState>) => {
-      if (!canvas) throw new Error('Could not load canvas')
+    const loadSavedState = (
+      key: string,
+      stateRef: React.RefObject<CanvasState>,
+      canvasRef: React.RefObject<HTMLCanvasElement>
+    ) => {
+      const stored = localStorage.getItem(key);
+      if (!stored) return;
+      try {
+        stateRef.current = JSON.parse(stored);
+        if (canvasRef.current) {
+          redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex)
+        }
+      } catch (error) {
+        console.warn('Failed to parse saved canvas state', key, error);
+      }
+    };
+
+    loadSavedState('canvasStateLeft', canvasStateLeftRef, canvasLeftRef);
+    loadSavedState('canvasStateRight', canvasStateRightRef, canvasRightRef);
+
+    const setupCanvas = (canvas: HTMLCanvasElement | null, stateRef: React.RefObject<CanvasState>, side: 'left' | 'right') => {
+      if (!canvas) return () => {}
       const ctx = canvas.getContext('2d');
 
       const resizeCanvas = () => {
         canvas.width = canvas.offsetWidth;
         canvas.height = canvas.offsetHeight;
+
+        if (ctx) {
+          redrawCanvas(canvas, stateRef.current.history, stateRef.current.historyIndex)
+        }
       };
 
       resizeCanvas();
 
       let rect = canvas.getBoundingClientRect();
       const isDrawing = { current: false }
-
       let currentStroke: Stroke | null = null;
 
       const onMouseDown = (event: MouseEvent) => {
         const isLeftCanvas = canvas.id === 'canvasLeft';
-        if (playerSideRef.current && playerSideRef.current !== (isLeftCanvas ? 'left' : right)) {
+        if (playerSideRef.current && playerSideRef.current !== (isLeftCanvas ? 'left' : 'right')) {
           return;
         }
 
@@ -203,18 +246,14 @@ export default function App() {
         stateRef.current.history.push(currentStroke);
         stateRef.current.historyIndex += 1;
 
-        if (playerSideRef.current === (isLeftCanvas ? 'left' : 'right') && socketRef.current && roomId) {
-          socketRef.current.emit('draw', {
-            room: roomId,
-            drawStroke: currentStroke
-          })
-        }
+        localStorage.setItem(isLeftCanvas ? 'canvasStateLeft' : 'canvasStateRight', JSON.stringify(stateRef.current));
 
         // Emit stroke to server only if this is the player's assigned canvas
-        if (playerSideRef.current === (isLeftCanvas ? 'left' : 'right') && socketRef.current && roomId) {
-          socketRef.current.emit('draw', {
-            room: roomId,
-            drawStroke: currentStroke
+          if (playerSideRef.current === (isLeftCanvas ? 'left' : 'right') && socketRef.current && roomIdRef.current) {          
+            socketRef.current.emit('draw', {
+              room: roomIdRef.current,
+              drawStroke: currentStroke,
+              side: isLeftCanvas ? 'left' : 'right',
           });
         }
 
@@ -241,8 +280,8 @@ export default function App() {
       }
     };
 
-    const cleanupLeft = setupCanvas(canvasLeftRef.current, canvasStateLeftRef);
-    const cleanupRight = setupCanvas(canvasRightRef.current, canvasStateRightRef);
+    const cleanupLeft = setupCanvas(canvasLeftRef.current, canvasStateLeftRef, 'left');
+    const cleanupRight = setupCanvas(canvasRightRef.current, canvasStateRightRef, 'right');
 
     return () => {
       cleanupLeft();

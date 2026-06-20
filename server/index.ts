@@ -53,9 +53,12 @@ io.on('connection', (socket) => {
     });
 
     // Listen for drawing
-    socket.on('draw', (data: { room: string; drawStroke: Stroke }) => {
+    socket.on('draw', (data: { room: string; drawStroke: Stroke; side: 'left' | 'right' }) => {
         // Forward stroke to the other player in the room
-        socket.to(data.room).emit('opponent_draw', data.drawStroke)
+        socket.to(data.room).emit('opponent_draw', {
+            side: data.side,
+            stroke: data.drawStroke,
+        });
     });
 
     socket.on('disconnect', () => {
