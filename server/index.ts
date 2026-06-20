@@ -61,6 +61,16 @@ io.on('connection', (socket) => {
         });
     });
 
+    // Listen for undo
+    socket.on('undo', (data: {room: string }) => {
+        socket.to(data.room).emit('undo', data);
+    });
+
+    // Listen for redo
+    socket.on('undo', (data: {room: string }) => {
+        socket.to(data.room).emit('undo', data);
+    });
+
     socket.on('disconnect', () => {
         console.log(`User ${socket.id} disconnected.`)
 

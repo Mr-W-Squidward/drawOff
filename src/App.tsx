@@ -25,6 +25,11 @@ export default function App() {
     if (stateRef.current.historyIndex >= 0) {
         stateRef.current.historyIndex--;
         redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex)
+        
+        if (socketRef.current && roomIdRef.current) {
+          socketRef.current.emit('undo', { room: roomIdRef.current });
+        }
+
         forceUpdate({});
     }
   }
@@ -34,6 +39,11 @@ export default function App() {
     if (stateRef.current.historyIndex + 1 < stateRef.current.history.length) {
       stateRef.current.historyIndex++;
       redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex)
+      
+      if (socketRef.current && roomIdRef.current) {
+        socketRef.current.emit('redo', { room: roomIdRef.current });
+      }
+
       forceUpdate({});
     } 
   }
