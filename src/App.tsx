@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useState } from "react";
+import { io, Socket } from 'socket.io-client';
 import type { Tool, Stroke, CanvasState } from './types/canvas.types';
 import { redrawCanvas } from './utils/canvasUtils'
 import wordList, { chooseRandomWord } from './constants/constants'
@@ -6,6 +7,8 @@ import wordList, { chooseRandomWord } from './constants/constants'
 export default function App() {
   const brushColourRef = useRef("black");
   const lineWidthRef = useRef(4);
+  const socketRef = useRef<Socket | null>(null);
+  const playerSideRef = useRef<'left' | 'right' | null>(null);
   const canvasLeftRef = useRef<HTMLCanvasElement>(null);
   const canvasRightRef = useRef<HTMLCanvasElement>(null);
   const canvasStateLeftRef = useRef<CanvasState>({ history: [], historyIndex: -1, currentTool: 'brush' })
@@ -15,6 +18,7 @@ export default function App() {
   const [showColourWheel, setShowColourWheel] = useState(false);
   const [eraserSelected, setEraserSelected] = useState(false)
   const [, forceUpdate] = useState({});
+  const [roomId, setRoomId] = useState<string | null>(null);
 
   function undoStroke(canvasRef: React.RefObject<HTMLCanvasElement | null>, stateRef: React.RefObject<CanvasState>) {
     if (!canvasRef.current) return;
@@ -43,9 +47,49 @@ export default function App() {
     const colour = e.target.value;
     brushColourRef.current = colour;
   }
-
+  
+  
   // Canvas drawing refs -> add line width / colour wheel / socket.io later
   const [selectedWord] = useState(() => chooseRandomWord(wordList));
+
+  // Drawing with SOCKET.IO
+  useEffect(() => {
+    const socket = io('http://localhost:5174');
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      console.log('Connected to server: ', socket.id)
+
+      const room = `game_${123123}`;
+      setRoomId(room);
+      socket.emit('join_room', room)
+    });
+
+    socket.on('player_side_assigned', (side: 'left' | 'right') => {
+      playerSideRef.current = side;
+    });
+
+    socket.on('opponent_draw', (stroke: Stroke) => {
+      const stateRef = playerSideRef.current === 'left' ? canvasStateRightRef : canvasStateLeftRef;
+      const canvasRef = playerSideRef.current === 'left' ? canvasRightRef : canvasLeftRef;
+
+      // STROKE goes to OPPONENT'S history
+      stateRef.current.history.push(stroke);
+      stateRef.current.historyIndex += 1;
+      
+      if (canvasRef.current) {
+        redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex);
+      };
+
+      socket.on('disconnect' , () => {
+        console.log("Disconnected from server");
+      });
+
+      return () => {
+        socket.disconnect();
+      }
+    })
+  }, [])
   
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -86,6 +130,11 @@ export default function App() {
       let currentStroke: Stroke | null = null;
 
       const onMouseDown = (event: MouseEvent) => {
+        const isLeftCanvas = canvas.id === 'canvasLeft';
+        if (playerSideRef.current && playerSideRef.current !== (isLeftCanvas ? 'left' : right)) {
+          return;
+        }
+
         // Determine tool based on mouse button
         const isRightClick = event.button === 2;
         const toolToUse = isRightClick ? 'eraser' : 'brush';
@@ -143,12 +192,31 @@ export default function App() {
         
         isDrawing.current = false;
 
+        // Determine which canvas this is
+        const isLeftCanvas = canvas.id === 'canvasLeft';
+        const stateRef = isLeftCanvas ? canvasStateLeftRef : canvasStateRightRef;
+
         // Remove any redo history (when drawn)
         stateRef.current.history = stateRef.current.history.slice(0, stateRef.current.historyIndex+1);
 
         // Add stroke to history
         stateRef.current.history.push(currentStroke);
         stateRef.current.historyIndex += 1;
+
+        if (playerSideRef.current === (isLeftCanvas ? 'left' : 'right') && socketRef.current && roomId) {
+          socketRef.current.emit('draw', {
+            room: roomId,
+            drawStroke: currentStroke
+          })
+        }
+
+        // Emit stroke to server only if this is the player's assigned canvas
+        if (playerSideRef.current === (isLeftCanvas ? 'left' : 'right') && socketRef.current && roomId) {
+          socketRef.current.emit('draw', {
+            room: roomId,
+            drawStroke: currentStroke
+          });
+        }
 
         currentStroke = null;
         
@@ -187,15 +255,25 @@ export default function App() {
       <div className="w-full h-screen bg-[#000000] flex flex-col">
         {/* Fixed Toolbar at Top */}
         <header className="flex-shrink-0 bg-[#1a1a1a] border-b border-gray-700 p-4 z-30">
-          <div className="flex justify-center items-center gap-6">
-            {/* Saved Colours */}
-            <div className="flex items-center justify-center gap-2 select-none pointer-events-auto">
-              <button className="w-8 h-8 bg-[#000000] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#000000")} title="Black"/>
-              <button className="w-8 h-8 bg-[#FF0000] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#FF0000")} title="Red"></button>
-              <button className="w-8 h-8 bg-[#0000FF] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#0000FF")} title="Blue"></button>
-              <button className="w-8 h-8 bg-[#00FF00] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#00FF00")} title="Green"></button>
-              <button className="w-8 h-8 bg-[#FFFF00] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#FFFF00")} title="Yellow"></button>
+          <div className="flex justify-between items-center">
+            {/* Player Info */}
+            <div className="text-white text-sm">
+              <div>Room: <span className="font-mono text-yellow-400">{roomId || 'Connecting...'}</span></div>
+              <div>Side: <span className={`font-bold ${playerSideRef.current === 'left' ? 'text-blue-400' : playerSideRef.current === 'right' ? 'text-red-400' : 'text-gray-400'}`}>
+                {playerSideRef.current ? playerSideRef.current.toUpperCase() : 'Waiting...'}
+              </span>
+              </div>
             </div>
+
+            <div className="flex justify-center items-center gap-6">
+              {/* Saved Colours */}
+              <div className="flex items-center justify-center gap-2 select-none pointer-events-auto">
+                <button className="w-8 h-8 bg-[#000000] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#000000")} title="Black"/>
+                <button className="w-8 h-8 bg-[#FF0000] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#FF0000")} title="Red"></button>
+                <button className="w-8 h-8 bg-[#0000FF] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#0000FF")} title="Blue"></button>
+                <button className="w-8 h-8 bg-[#00FF00] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#00FF00")} title="Green"></button>
+                <button className="w-8 h-8 bg-[#FFFF00] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#FFFF00")} title="Yellow"></button>
+              </div>
 
             {/* Colour Wheel Picker */}
             <div className="relative">
@@ -232,6 +310,7 @@ export default function App() {
                 }}
                 className="w-32"
               />
+              </div>
             </div>
           </div>
         </header>
