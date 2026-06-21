@@ -98,6 +98,26 @@ export default function App() {
       }
     });
 
+    socket.on('room_state', (data: { 
+      left: { history: Stroke[], index: number };
+      right: { history: Stroke[], index: number };
+    }) => {
+      
+      canvasStateLeftRef.current.history = data.left.history;
+      canvasStateLeftRef.current.historyIndex = data.left.index;
+
+      canvasStateRightRef.current.history = data.right.history;
+      canvasStateRightRef.current.historyIndex = data.right.index;
+
+      if (canvasLeftRef.current) {
+        redrawCanvas(canvasLeftRef.current, data.left.history, data.left.index);
+      };
+
+      if (canvasRightRef.current) {
+        redrawCanvas(canvasRightRef.current, data.right.history, data.right.index);
+      }
+    });
+
     socket.on('disconnect', () => {
       console.log('❌ Disconnected from server');
     });
