@@ -1,0 +1,427 @@
+import React, { useRef, useEffect, useState } from "react";
+import { io, Socket } from 'socket.io-client';
+import type { Tool, Stroke, CanvasState } from '../types/canvas.types';
+import { redrawCanvas } from '../utils/canvasUtils'
+import wordList, { chooseRandomWord } from '../constants/constants'
+import { useParams } from "react-router-dom";
+
+const createNewRoom = () => `game_${(Math.random() * 100000).toString(6)}`;
+
+export default function Game() {
+  const { roomId: routeRoomId } = useParams<{ roomId?: string }>()
+  const brushColourRef = useRef("black");
+  const lineWidthRef = useRef(4);
+  const socketRef = useRef<Socket | null>(null);
+  const playerSideRef = useRef<'left' | 'right' | null>(null);
+  const canvasLeftRef = useRef<HTMLCanvasElement>(null);
+  const canvasRightRef = useRef<HTMLCanvasElement>(null);
+  const canvasStateLeftRef = useRef<CanvasState>({ history: [], historyIndex: -1, currentTool: 'brush' })
+  const canvasStateRightRef = useRef<CanvasState>({ history: [], historyIndex: -1, currentTool: 'brush' })
+  const [leftVotes, setLeftVotes] = useState(0);
+  const [rightVotes, setRightVotes] = useState(0);
+  const [showColourWheel, setShowColourWheel] = useState(false);
+  const [eraserSelected, setEraserSelected] = useState(false)
+  const [, forceUpdate] = useState({});
+  const [roomId, setRoomId] = useState<string | null>(routeRoomId ?? null);
+
+  function undoStroke(canvasRef: React.RefObject<HTMLCanvasElement | null>, stateRef: React.RefObject<CanvasState>) {
+    if (!canvasRef.current) return;
+    if (stateRef.current.historyIndex >= 0) {
+        stateRef.current.historyIndex--;
+        redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex)
+        
+        if (socketRef.current && roomIdRef.current) {
+          socketRef.current.emit('undo', { room: roomIdRef.current });
+        }
+
+        forceUpdate({});
+    }
+  }
+
+  function redoStroke(canvasRef: React.RefObject<HTMLCanvasElement | null>, stateRef: React.RefObject<CanvasState>) {
+    if (!canvasRef.current) return;
+    if (stateRef.current.historyIndex + 1 < stateRef.current.history.length) {
+      stateRef.current.historyIndex++;
+      redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex)
+      
+      if (socketRef.current && roomIdRef.current) {
+        socketRef.current.emit('redo', { room: roomIdRef.current });
+      }
+
+      forceUpdate({});
+    } 
+  }
+
+  function changeColour(brushColour: string) {
+    brushColourRef.current = brushColour;
+    setShowColourWheel(false);
+  }
+
+  function handleColourWheelChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const colour = e.target.value;
+    brushColourRef.current = colour;
+  }
+  
+  
+  // Canvas drawing refs -> add line width / colour wheel / socket.io later
+  const [selectedWord] = useState(() => chooseRandomWord(wordList));
+  const roomIdRef = useRef<string | null>(null);
+
+  // Drawing with SOCKET.IO
+  useEffect(() => {
+    const socket = io('http://localhost:5174');
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      const room = routeRoomId ?? null;
+      roomIdRef.current = room;
+      setRoomId(room);
+      console.log('✅ Connected to server:', socket.id, 'room:', room);
+
+      socket.emit('join_room', room);
+    });
+
+    socket.on('player_side_assigned', (side: 'left' | 'right') => {
+      console.log('🎯 player_side_assigned received:', side);
+      playerSideRef.current = side;
+      forceUpdate({});
+    });
+
+    socket.on('opponent_draw', (data: {side: 'left' | 'right'; stroke: Stroke }) => {
+      console.log('🎨 opponent_draw received, player side:', playerSideRef.current);
+      const stateRef = data.side === 'left' ? canvasStateLeftRef : canvasStateRightRef;
+      const canvasRef = data.side === 'left' ? canvasLeftRef : canvasRightRef;
+
+      // STROKE goes to OPPONENT'S history
+      stateRef.current.history = stateRef.current.history.slice(0, stateRef.current.historyIndex+1);
+      stateRef.current.history.push(data.stroke);
+      stateRef.current.historyIndex += 1;
+      
+      if (canvasRef.current) {
+        redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex);
+      }
+    });
+
+    socket.on('room_state', (data: { 
+      left: { history: Stroke[], index: number };
+      right: { history: Stroke[], index: number };
+    }) => {
+      
+      canvasStateLeftRef.current.history = data.left.history;
+      canvasStateLeftRef.current.historyIndex = data.left.index;
+
+      canvasStateRightRef.current.history = data.right.history;
+      canvasStateRightRef.current.historyIndex = data.right.index;
+
+      if (canvasLeftRef.current) {
+        redrawCanvas(canvasLeftRef.current, data.left.history, data.left.index);
+      };
+
+      if (canvasRightRef.current) {
+        redrawCanvas(canvasRightRef.current, data.right.history, data.right.index);
+      }
+    });
+
+    socket.on('disconnect', () => {
+      console.log('❌ Disconnected from server');
+    });
+
+    socket.on('connect_error', (error) => {
+      console.error('❌ Connection error:', error);
+    });
+
+    return () => {
+      // Reload persistence
+      localStorage.setItem('canvasStateLeft', JSON.stringify(canvasStateLeftRef.current));
+      localStorage.setItem('canvasStateRight', JSON.stringify(canvasStateRightRef.current));
+      socket.disconnect();
+    };
+  }, [routeRoomId]);
+  
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key === 'z') {
+          e.preventDefault()
+          
+          if (playerSideRef.current === 'left') {
+            undoStroke(canvasLeftRef, canvasStateLeftRef);
+          } else {
+            undoStroke(canvasRightRef, canvasStateRightRef);
+          }
+        };
+
+        if (e.key === 'y') {
+          e.preventDefault()
+          if (playerSideRef.current === 'left') {
+            redoStroke(canvasLeftRef, canvasStateLeftRef);
+          } else {
+            redoStroke(canvasRightRef, canvasStateRightRef);
+          }
+        };
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, []);
+  
+  useEffect(() => {
+    const loadSavedState = (
+      key: string,
+      stateRef: React.RefObject<CanvasState>,
+      canvasRef: React.RefObject<HTMLCanvasElement>
+    ) => {
+      const stored = localStorage.getItem(key);
+      if (!stored) return;
+      try {
+        stateRef.current = JSON.parse(stored);
+        if (canvasRef.current) {
+          redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex)
+        }
+      } catch (error) {
+        console.warn('Failed to parse saved canvas state', key, error);
+      }
+    };
+
+    loadSavedState('canvasStateLeft', canvasStateLeftRef, canvasLeftRef);
+    loadSavedState('canvasStateRight', canvasStateRightRef, canvasRightRef);
+
+    const setupCanvas = (canvas: HTMLCanvasElement | null, stateRef: React.RefObject<CanvasState>, side: 'left' | 'right') => {
+      if (!canvas) return () => {}
+      const ctx = canvas.getContext('2d');
+
+      const resizeCanvas = () => {
+        canvas.width = canvas.offsetWidth;
+        canvas.height = canvas.offsetHeight;
+
+        if (ctx) {
+          redrawCanvas(canvas, stateRef.current.history, stateRef.current.historyIndex)
+        }
+      };
+
+      resizeCanvas();
+
+      let rect = canvas.getBoundingClientRect();
+      const isDrawing = { current: false }
+      let currentStroke: Stroke | null = null;
+
+      const onMouseDown = (event: MouseEvent) => {
+        const isLeftCanvas = canvas.id === 'canvasLeft';
+        if (playerSideRef.current && playerSideRef.current !== (isLeftCanvas ? 'left' : 'right')) {
+          return;
+        }
+
+        // Determine tool based on mouse button
+        const isRightClick = event.button === 2;
+        const toolToUse = isRightClick ? 'eraser' : 'brush';
+        
+        rect = canvas.getBoundingClientRect();
+        isDrawing.current = true;
+        if (!ctx) return;
+        
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        
+        currentStroke = {
+          type: toolToUse,
+          colour: brushColourRef.current,
+          width: lineWidthRef.current,
+          points: [{ x, y }]
+        };
+        
+        if (toolToUse === 'eraser') {
+          ctx.globalCompositeOperation = 'destination-out';
+          ctx.strokeStyle = canvas.id === 'canvasLeft' ? '#123123' : '#521312';
+          setEraserSelected(true);
+        } else {
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.strokeStyle = brushColourRef.current;
+          setEraserSelected(false);
+        }
+        
+        ctx.lineWidth = lineWidthRef.current;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+      };
+
+      const onContextMenu = (event: MouseEvent) => {
+        event.preventDefault()
+      }
+
+      const onMouseMove = (event: MouseEvent) => {
+        if (!isDrawing.current || !ctx || !currentStroke) return;
+        
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        
+        currentStroke.points.push({ x, y });
+        ctx.lineTo(x, y);
+        ctx.stroke();
+      }
+
+      const stopDrawing = () => {
+        if (!isDrawing.current || !currentStroke) {
+          isDrawing.current = false;
+          return;
+        }
+        
+        isDrawing.current = false;
+
+        // Determine which canvas this is
+        const isLeftCanvas = canvas.id === 'canvasLeft';
+        const stateRef = isLeftCanvas ? canvasStateLeftRef : canvasStateRightRef;
+
+        // Remove any redo history (when drawn)
+        stateRef.current.history = stateRef.current.history.slice(0, stateRef.current.historyIndex+1);
+
+        // Add stroke to history
+        stateRef.current.history.push(currentStroke);
+        stateRef.current.historyIndex += 1;
+
+        localStorage.setItem(isLeftCanvas ? 'canvasStateLeft' : 'canvasStateRight', JSON.stringify(stateRef.current));
+
+        // Emit stroke to server only if this is the player's assigned canvas
+          if (playerSideRef.current === (isLeftCanvas ? 'left' : 'right') && socketRef.current && roomIdRef.current) {          
+            socketRef.current.emit('draw', {
+              room: roomIdRef.current,
+              drawStroke: currentStroke,
+              side: isLeftCanvas ? 'left' : 'right',
+          });
+        }
+
+        currentStroke = null;
+        
+        // Reset eraser on mouse release
+        setEraserSelected(false);
+      }
+      
+      canvas.addEventListener("mousedown", onMouseDown);
+      canvas.addEventListener("mousemove", onMouseMove);
+      canvas.addEventListener('mouseup', stopDrawing);
+      canvas.addEventListener('mouseleave', stopDrawing);
+      canvas.addEventListener('contextmenu', onContextMenu)
+      window.addEventListener('resize', resizeCanvas);
+
+      return () => {
+        canvas.removeEventListener("mousedown", onMouseDown);
+        canvas.removeEventListener("mousemove", onMouseMove);
+        canvas.removeEventListener('mouseup', stopDrawing);
+        canvas.removeEventListener('mouseleave', stopDrawing);
+        canvas.removeEventListener('contextmenu', onContextMenu)
+        window.removeEventListener('resize', resizeCanvas);
+      }
+    };
+
+    const cleanupLeft = setupCanvas(canvasLeftRef.current, canvasStateLeftRef, 'left');
+    const cleanupRight = setupCanvas(canvasRightRef.current, canvasStateRightRef, 'right');
+
+    return () => {
+      cleanupLeft();
+      cleanupRight();
+    };
+  }, []);
+
+  return (
+    <>
+      <div className="w-full h-screen bg-[#000000] flex flex-col">
+        {/* Fixed Toolbar at Top */}
+        <header className="flex-shrink-0 bg-[#1a1a1a] border-b border-gray-700 p-4 z-30">
+          <div className="flex justify-between items-center">
+            {/* Player Info */}
+            <div className="text-white text-sm">
+              <div>Room: <span className="font-mono text-yellow-400">{roomId || 'Connecting...'}</span></div>
+              <div>Side: <span className={`font-bold ${playerSideRef.current === 'left' ? 'text-blue-400' : playerSideRef.current === 'right' ? 'text-red-400' : 'text-gray-400'}`}>
+                {playerSideRef.current ? playerSideRef.current.toUpperCase() : 'Waiting...'}
+              </span>
+              </div>
+            </div>
+
+            <div className="flex justify-center items-center gap-6">
+              {/* Saved Colours */}
+              <div className="flex items-center justify-center gap-2 select-none pointer-events-auto">
+                <button className="w-8 h-8 bg-[#000000] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#000000")} title="Black"/>
+                <button className="w-8 h-8 bg-[#FF0000] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#FF0000")} title="Red"></button>
+                <button className="w-8 h-8 bg-[#0000FF] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#0000FF")} title="Blue"></button>
+                <button className="w-8 h-8 bg-[#00FF00] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#00FF00")} title="Green"></button>
+                <button className="w-8 h-8 bg-[#FFFF00] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#FFFF00")} title="Yellow"></button>
+              </div>
+
+            {/* Colour Wheel Picker */}
+            <div className="relative">
+              <button 
+                className="px-3 py-1 bg-gray-700 hover:bg-gray-600 border border-gray-500 text-white text-sm transition"
+                onClick={() => setShowColourWheel(!showColourWheel)}
+              >
+                Colour Wheel
+              </button>
+              {showColourWheel && (
+                <div className="absolute top-full mt-2 left-0 bg-[#2a2a2a] border border-gray-500 p-3 rounded z-40">
+                  <input 
+                    type="color" 
+                    defaultValue={brushColourRef.current} 
+                    onChange={handleColourWheelChange}
+                    className="w-16 h-16 cursor-pointer"
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Line Width Slider */}
+            <div className="flex items-center gap-2">
+              <label className="text-white text-sm">Line Width:</label>
+              <input
+                type="range"
+                min="1"
+                max="16"
+                step="1"
+                defaultValue={lineWidthRef.current}
+                onChange={(e) => {
+                  const v = Number((e.target as HTMLInputElement).value);
+                  lineWidthRef.current = v;
+                }}
+                className="w-32"
+              />
+              </div>
+            </div>
+          </div>
+        </header>
+
+        {/* Game Wrapper */}
+        <div className="relative flex-1 flex overflow-hidden">
+
+          {/* Drawing Prompt */}
+          <h1 className="absolute inset-x-0 top-1/2 transform -translate-y-1/2 text-center z-10 select-none pointer-events-none">
+            <span className="inline-block border border-black px-3 py-2 bg-[#345421] text-white text-3xl font-bold">
+              {selectedWord}
+            </span>
+          </h1>
+
+          {/* Canvas Wrapper */}
+          <div className="flex flex-1 relative">
+
+            <div className="relative w-1/2">
+              <canvas id="canvasLeft" className="w-full h-full bg-[#123123]" ref={canvasLeftRef}/>
+              {/* Left Vote Counter */}
+              <div className="absolute bottom-4 left-4 bg-[#1a1a1a] border-2 border-gray-500 px-3 py-2 text-white font-bold text-lg z-20">
+                <div className="text-xs text-gray-400">Votes</div>
+                <div className="text-2xl">{leftVotes}</div>
+              </div>
+            </div>
+
+            <div className="relative w-1/2">
+              <canvas id="canvasRight" className="w-full h-full bg-[#521312]" ref={canvasRightRef}/>
+              {/* Right Vote Counter */}
+              <div className="absolute bottom-4 right-4 bg-[#1a1a1a] border-2 border-gray-500 px-3 py-2 text-white font-bold text-lg z-20">
+                <div className="text-xs text-gray-400">Votes</div>
+                <div className="text-2xl">{rightVotes}</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </>
+  )
+}

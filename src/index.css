@@ -1,1 +1,15 @@
 @import "tailwindcss";
+
+@theme {
+    --animate-bobble: bobble 3s ease-in-out infinite;
+
+    @keyframes bobble {
+        0%, 100% {
+            transform: translateY(0) scale(1);
+        }
+
+        50% {
+            transform: translateY(-5    px) scale(1.03);
+        }
+    }
+}
