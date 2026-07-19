@@ -1,4 +1,4 @@
-import React, { useEffect, type JSX } from "react";
+import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 
 const makeRoomId = () => `game_${Math.floor(Math.random() * 100000)}`

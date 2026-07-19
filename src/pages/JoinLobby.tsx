@@ -1,4 +1,4 @@
-import React, { useState, type JSX } from "react";
+import { useState, type JSX } from "react";
 import { useNavigate } from "react-router-dom";
 
 export default function JoinLobby(): JSX.Element {

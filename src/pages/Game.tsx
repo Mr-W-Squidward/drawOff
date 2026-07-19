@@ -1,11 +1,9 @@
-import React, { useRef, useEffect, useState } from "react";
+import { useRef, useEffect, useState, type RefObject } from "react";
 import { io, Socket } from 'socket.io-client';
-import type { Tool, Stroke, CanvasState } from '../types/canvas.types';
+import type { Stroke, CanvasState } from '../types/canvas.types';
 import { redrawCanvas } from '../utils/canvasUtils'
 import wordList, { chooseRandomWord } from '../constants/constants'
 import { useParams } from "react-router-dom";
-
-const createNewRoom = () => `game_${(Math.random() * 100000).toString(6)}`;
 
 export default function Game() {
   const { roomId: routeRoomId } = useParams<{ roomId?: string }>()
@@ -17,14 +15,14 @@ export default function Game() {
   const canvasRightRef = useRef<HTMLCanvasElement>(null);
   const canvasStateLeftRef = useRef<CanvasState>({ history: [], historyIndex: -1, currentTool: 'brush' })
   const canvasStateRightRef = useRef<CanvasState>({ history: [], historyIndex: -1, currentTool: 'brush' })
-  const [leftVotes, setLeftVotes] = useState(0);
-  const [rightVotes, setRightVotes] = useState(0);
+  const [leftVotes] = useState(0);
+  const [rightVotes] = useState(0);
   const [showColourWheel, setShowColourWheel] = useState(false);
-  const [eraserSelected, setEraserSelected] = useState(false)
+  const [playerSide, setPlayerSide] = useState<'left' | 'right' | null>(null);
   const [, forceUpdate] = useState({});
   const [roomId, setRoomId] = useState<string | null>(routeRoomId ?? null);
 
-  function undoStroke(canvasRef: React.RefObject<HTMLCanvasElement | null>, stateRef: React.RefObject<CanvasState>) {
+  function undoStroke(canvasRef: RefObject<HTMLCanvasElement | null>, stateRef: RefObject<CanvasState>) {
     if (!canvasRef.current) return;
     if (stateRef.current.historyIndex >= 0) {
         stateRef.current.historyIndex--;
@@ -38,7 +36,7 @@ export default function Game() {
     }
   }
 
-  function redoStroke(canvasRef: React.RefObject<HTMLCanvasElement | null>, stateRef: React.RefObject<CanvasState>) {
+  function redoStroke(canvasRef: RefObject<HTMLCanvasElement | null>, stateRef: RefObject<CanvasState>) {
     if (!canvasRef.current) return;
     if (stateRef.current.historyIndex + 1 < stateRef.current.history.length) {
       stateRef.current.historyIndex++;
@@ -84,6 +82,7 @@ export default function Game() {
     socket.on('player_side_assigned', (side: 'left' | 'right') => {
       console.log('🎯 player_side_assigned received:', side);
       playerSideRef.current = side;
+      setPlayerSide(side);
       forceUpdate({});
     });
 
@@ -169,8 +168,8 @@ export default function Game() {
   useEffect(() => {
     const loadSavedState = (
       key: string,
-      stateRef: React.RefObject<CanvasState>,
-      canvasRef: React.RefObject<HTMLCanvasElement>
+      stateRef: RefObject<CanvasState>,
+      canvasRef: RefObject<HTMLCanvasElement | null>
     ) => {
       const stored = localStorage.getItem(key);
       if (!stored) return;
@@ -187,7 +186,7 @@ export default function Game() {
     loadSavedState('canvasStateLeft', canvasStateLeftRef, canvasLeftRef);
     loadSavedState('canvasStateRight', canvasStateRightRef, canvasRightRef);
 
-    const setupCanvas = (canvas: HTMLCanvasElement | null, stateRef: React.RefObject<CanvasState>, side: 'left' | 'right') => {
+    const setupCanvas = (canvas: HTMLCanvasElement | null, stateRef: RefObject<CanvasState>) => {
       if (!canvas) return () => {}
       const ctx = canvas.getContext('2d');
 
@@ -233,11 +232,9 @@ export default function Game() {
         if (toolToUse === 'eraser') {
           ctx.globalCompositeOperation = 'destination-out';
           ctx.strokeStyle = canvas.id === 'canvasLeft' ? '#123123' : '#521312';
-          setEraserSelected(true);
         } else {
           ctx.globalCompositeOperation = 'source-over';
           ctx.strokeStyle = brushColourRef.current;
-          setEraserSelected(false);
         }
         
         ctx.lineWidth = lineWidthRef.current;
@@ -293,8 +290,6 @@ export default function Game() {
 
         currentStroke = null;
         
-        // Reset eraser on mouse release
-        setEraserSelected(false);
       }
       
       canvas.addEventListener("mousedown", onMouseDown);
@@ -314,8 +309,8 @@ export default function Game() {
       }
     };
 
-    const cleanupLeft = setupCanvas(canvasLeftRef.current, canvasStateLeftRef, 'left');
-    const cleanupRight = setupCanvas(canvasRightRef.current, canvasStateRightRef, 'right');
+    const cleanupLeft = setupCanvas(canvasLeftRef.current, canvasStateLeftRef);
+    const cleanupRight = setupCanvas(canvasRightRef.current, canvasStateRightRef);
 
     return () => {
       cleanupLeft();
@@ -332,8 +327,8 @@ export default function Game() {
             {/* Player Info */}
             <div className="text-white text-sm">
               <div>Room: <span className="font-mono text-yellow-400">{roomId || 'Connecting...'}</span></div>
-              <div>Side: <span className={`font-bold ${playerSideRef.current === 'left' ? 'text-blue-400' : playerSideRef.current === 'right' ? 'text-red-400' : 'text-gray-400'}`}>
-                {playerSideRef.current ? playerSideRef.current.toUpperCase() : 'Waiting...'}
+              <div>Side: <span className={`font-bold ${playerSide === 'left' ? 'text-blue-400' : playerSide === 'right' ? 'text-red-400' : 'text-gray-400'}`}>
+                {playerSide ? playerSide.toUpperCase() : 'Waiting...'}
               </span>
               </div>
             </div>
@@ -360,7 +355,7 @@ export default function Game() {
                 <div className="absolute top-full mt-2 left-0 bg-[#2a2a2a] border border-gray-500 p-3 rounded z-40">
                   <input 
                     type="color" 
-                    defaultValue={brushColourRef.current} 
+                    defaultValue="black"
                     onChange={handleColourWheelChange}
                     className="w-16 h-16 cursor-pointer"
                   />
@@ -376,7 +371,7 @@ export default function Game() {
                 min="1"
                 max="16"
                 step="1"
-                defaultValue={lineWidthRef.current}
+                defaultValue={4}
                 onChange={(e) => {
                   const v = Number((e.target as HTMLInputElement).value);
                   lineWidthRef.current = v;

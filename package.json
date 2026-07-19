@@ -4,13 +4,17 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"vite\" \"npm --prefix server run dev\"",
+    "dev": "concurrently -n frontend,socket -c blue,magenta --kill-others-on-fail \"npm run dev:frontend\" \"npm run dev:socket\"",
+    "dev:frontend": "vite",
+    "dev:socket": "npm --prefix server run dev",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@libsql/client": "^0.17.4",
     "@tailwindcss/vite": "^4.3.0",
+    "better-sqlite3": "^11.9.1",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "lucide-react": "^1.23.0",

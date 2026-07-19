@@ -1,6 +1,7 @@
 import { Link, useNavigate } from "react-router-dom"
-import React, { useState, type JSX } from "react"
+import { useState, type JSX } from "react"
 import { ChevronLeft, ChevronRight } from "lucide-react"
+import { StatsPanel } from "../components/statsPanel";
 
 const TUTORIAL = [
     {
@@ -13,11 +14,11 @@ const TUTORIAL = [
     },
     {
         title: "2. Compete",
-        description: "When it's your turn to draw, follow the prompt on-screen accordingly. Use your mouse or touch-screen to draw before time expires! Beat your opponent by drawing it better AND faster."
+        description: "Use your mouse or touch-screen to draw before time expires! Beat your opponent by drawing it better AND faster."
     },
     {
         title: "3. Cast Your Guess",
-        description: "Judging? Watch every stroke come to life and type your guesses in as fast as possible! Determine WHO wins and WHO loses with the others."
+        description: "Judging? Type your guesses in as fast as possible! Vote on the best drawing w/ others!"
     },
     {
         title: "4. Climb The Leaderboard",
@@ -66,6 +67,72 @@ export function HowToPlay() {
         </div>
     )
 };
+
+const NEWS_UPDATES = [
+    {
+        date: "Jul 14",
+        title: "Homepage Polish",
+        text: "The cards on the home screen, styling and stats menu have been readded/updated to work!"
+    },
+    {
+        date: "Jul 10",
+        title: "Something",
+        text: "Some work was done! Let me check GitHub!"
+    }
+]
+
+export function News() {
+    return (
+        <>
+            <style>
+                {`
+                    .news-scroll {
+                        scrollbar-width: thin;
+                        scrollbar-color: #4b5563 #2c2a3d;
+                    }
+
+                    .news-scroll::-webkit-scrollbar {
+                        width: 8px;
+                    }
+
+                    .news-scroll::-webkit-scrollbar-track {
+                        background: #2c2a3d;
+                        border-radius: 999px;
+                    }
+
+                    .news-scroll::-webkit-scrollbar-thumb {
+                        background: #4b5563;
+                        border-radius: 999px;
+                        border: 1px solid #2c2a3d;
+                    }
+
+                    .news-scroll::-webkit-scrollbar-thumb:hover {
+                        background: #374151;
+                    }
+                `}
+            </style>
+
+            <div className="mx-5 w-48 h-40 rounded-lg border border-white/20 bg-[#2c2a3d] text-left text-white">
+                <div className="news-scroll h-[calc(100%-1.5rem)] overflow-y-auto">
+                    <h4 className="text-center my-2 text-sm font-bold">News</h4>
+                    <div className="mt-1 space-y-2">
+                        {NEWS_UPDATES.map((item, index) => (
+                            <div key={index} className="rounded border border-white/10 bg-black/10 p-2">
+                                <div className="text-[10px] uppercase tracking-wide text-gray-300"> 
+                                    {item.date}
+                                </div>
+                                <div className="text-xs font-semibold">{item.title}</div>
+                                <p className="mt-1 text-[11px] leading-4 text-gray-200">
+                                    {item.text}
+                                </p>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            </div>
+        </>
+    )
+}
 
 export default function Home(): JSX.Element {
     const navigate = useNavigate();
@@ -118,16 +185,12 @@ export default function Home(): JSX.Element {
                         <button className="cursor-pointer border-4 border-double bg-blue-600 px-4 py-2 text-white rounded">Join Lobby</button>
                     </Link>
                     
-                    <div className="flex items-center justify-center">
+                    <div className="flex items-center justify-center mt-10">
                         <HowToPlay />
                             
-                        <div className="mx-5">
-                            <p>NEWS</p>
-                        </div>
+                        <News />
                         
-                        <div className="mx-5">
-                            <p>STATS</p>
-                        </div>
+                        <StatsPanel />
                     </div>
                 </div>
             </div>
