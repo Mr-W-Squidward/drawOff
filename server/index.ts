@@ -1,7 +1,8 @@
 import express from 'express';
 import { createServer } from 'node:http';
-import { Server } from 'socket.io';
+import { Server, type Socket } from 'socket.io';
 import cors from 'cors';
+import { randomUUID } from 'node:crypto';
 import type { Stroke } from '../src/types/canvas.types.ts';
 import { db, initDb } from './db.ts';
 
@@ -18,72 +19,248 @@ const io = new Server(server, {
     }
 });
 
+const ROOM_CAPACITY = 5;
+const ROUND_DURATION_MS = 60_000;
+const RESULT_DISPLAY_MS = 5_000;
+type RoomRole = 'left' | 'right' | 'judge';
+type RoundPhase = 'lobby' | 'drawing' | 'results';
+type Vote = 'left' | 'right';
+
 interface RoomState {
-    players: Map<string, 'left' | 'right'>;
+    members: Map<string, RoomRole>;
     historyLeft: Stroke[];
     historyRight: Stroke[];
     indexLeft: number;
     indexRight: number;
+    phase: RoundPhase;
+    roundEndsAt: number | null;
+    votes: Map<string, Vote>;
+    hasStarted: boolean;
+    endTimer: NodeJS.Timeout | undefined;
+    tickTimer: NodeJS.Timeout | undefined;
 }
 
 const rooms = new Map<string, RoomState>();
+const socketRooms = new Map<string, string>();
+
+// Socket.IO handlers may be async and adapters can make room operations async.
+// Serialising admission keeps "find a room" and "reserve its final slot" atomic.
+let admissionQueue = Promise.resolve();
+function withAdmissionLock<T>(operation: () => Promise<T> | T): Promise<T> {
+    const result = admissionQueue.then(operation, operation);
+    admissionQueue = result.then(() => undefined, () => undefined);
+    return result;
+}
+
+function createRoom(roomId = `game_${randomUUID()}`): [string, RoomState] {
+    const room: RoomState = {
+        members: new Map(),
+        historyLeft: [],
+        historyRight: [],
+        indexLeft: -1,
+        indexRight: -1,
+        phase: 'lobby',
+        roundEndsAt: null,
+        votes: new Map(),
+        hasStarted: false,
+        endTimer: undefined,
+        tickTimer: undefined,
+    };
+    rooms.set(roomId, room);
+    return [roomId, room];
+}
+
+function roleForRoom(room: RoomState): RoomRole {
+    if (![...room.members.values()].includes('left')) return 'left';
+    if (![...room.members.values()].includes('right')) return 'right';
+    return 'judge';
+}
+
+function clearRoundTimers(room: RoomState) {
+    if (room.endTimer) clearTimeout(room.endTimer);
+    if (room.tickTimer) clearInterval(room.tickTimer);
+    room.endTimer = undefined;
+    room.tickTimer = undefined;
+}
+
+function emitRoomState(roomId: string, room: RoomState) {
+    io.to(roomId).emit('room_state', {
+        left: { history: room.historyLeft, index: room.indexLeft },
+        right: { history: room.historyRight, index: room.indexRight },
+    });
+}
+
+function finishRound(roomId: string, room: RoomState) {
+    if (room.phase !== 'drawing') return;
+    clearRoundTimers(room);
+    room.phase = 'results';
+    room.roundEndsAt = null;
+
+    let leftVotes = 0;
+    let rightVotes = 0;
+    for (const vote of room.votes.values()) {
+        if (vote === 'left') leftVotes += 1;
+        else rightVotes += 1;
+    }
+    const winner: Vote | 'tie' = leftVotes === rightVotes ? 'tie' : leftVotes > rightVotes ? 'left' : 'right';
+    const displayUntil = Date.now() + RESULT_DISPLAY_MS;
+    io.to(roomId).emit('round_ended', { winner, leftVotes, rightVotes, displayUntil });
+
+    setTimeout(() => {
+        if (rooms.get(roomId) !== room || room.phase !== 'results') return;
+        room.phase = 'lobby';
+        room.votes.clear();
+        room.historyLeft = [];
+        room.historyRight = [];
+        room.indexLeft = -1;
+        room.indexRight = -1;
+        io.to(roomId).emit('round_reset', { phase: room.phase });
+        emitRoomState(roomId, room);
+    }, RESULT_DISPLAY_MS);
+}
+
+function startRound(roomId: string, room: RoomState) {
+    const roles = new Set(room.members.values());
+    if (room.phase !== 'lobby' || !roles.has('left') || !roles.has('right')) return false;
+
+    clearRoundTimers(room);
+    room.phase = 'drawing';
+    room.hasStarted = true;
+    room.votes.clear();
+    room.historyLeft = [];
+    room.historyRight = [];
+    room.indexLeft = -1;
+    room.indexRight = -1;
+    room.roundEndsAt = Date.now() + ROUND_DURATION_MS;
+    io.to(roomId).emit('round_started', { endsAt: room.roundEndsAt, durationMs: ROUND_DURATION_MS });
+    emitRoomState(roomId, room);
+    room.tickTimer = setInterval(() => {
+        if (room.phase !== 'drawing' || room.roundEndsAt === null) return;
+        io.to(roomId).emit('round_timer', { endsAt: room.roundEndsAt, remainingMs: Math.max(0, room.roundEndsAt - Date.now()) });
+    }, 1_000);
+    room.endTimer = setTimeout(() => finishRound(roomId, room), ROUND_DURATION_MS);
+    return true;
+}
+
+async function removeSocketFromRoom(socket: Socket) {
+    const roomId = socketRooms.get(socket.id);
+    if (!roomId) return;
+
+    socketRooms.delete(socket.id);
+    await socket.leave(roomId);
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    room.members.delete(socket.id);
+    if (room.members.size === 0) {
+        clearRoundTimers(room);
+        rooms.delete(roomId);
+    }
+}
+
+async function admit(socket: Socket, roomId: string) {
+    const room = rooms.get(roomId) ?? createRoom(roomId)[1];
+    const existingRole = room.members.get(socket.id);
+    if (existingRole) return { ok: true as const, roomId, role: existingRole, room };
+    if (room.members.size >= ROOM_CAPACITY) return { ok: false as const };
+
+    await removeSocketFromRoom(socket);
+    const role = roleForRoom(room);
+    room.members.set(socket.id, role); // Reserve before yielding to the adapter.
+    socketRooms.set(socket.id, roomId);
+    try {
+        await socket.join(roomId);
+    } catch (error) {
+        room.members.delete(socket.id);
+        socketRooms.delete(socket.id);
+        if (room.members.size === 0) {
+            clearRoundTimers(room);
+            rooms.delete(roomId);
+        }
+        throw error;
+    }
+    return { ok: true as const, roomId, role, room };
+}
+
+function emitAssignment(socket: Socket, roomId: string, role: RoomRole, room: RoomState) {
+    socket.emit('room_assigned', { roomId, role, capacity: ROOM_CAPACITY, memberCount: room.members.size });
+    if (role === 'judge') socket.emit('judge_assigned');
+    else socket.emit('player_side_assigned', role);
+    socket.emit('room_state', {
+        left: { history: room.historyLeft, index: room.indexLeft },
+        right: { history: room.historyRight, index: room.indexRight },
+    });
+    socket.emit('round_status', {
+        phase: room.phase,
+        endsAt: room.roundEndsAt,
+        hasStarted: room.hasStarted,
+    });
+    socket.emit('vote_status', {
+        votesCast: room.votes.size,
+        eligibleVoters: [...room.members.values()].filter((memberRole) => memberRole === 'judge').length,
+    });
+}
 
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`)
 
-    socket.on('join_room', (roomString: string) => {
-        socket.join(roomString);
-        console.log(`User ${socket.id} joined: ROOM ${roomString}`)
-
-        if (!rooms.has(roomString)) {
-            rooms.set(roomString, {
-                players: new Map(),
-                historyLeft: [],
-                historyRight: [],
-                indexLeft: -1,
-                indexRight: -1
-            });
+    socket.on('join_room', async (roomId: unknown) => {
+        if (typeof roomId !== 'string' || !roomId.trim()) {
+            socket.emit('room_join_error', { code: 'invalid_room' });
+            return;
         }
-
-        const roomState = rooms.get(roomString)!;
-
-        const roomSockets = io.sockets.adapter.rooms.get(roomString) || new Set<string>();
-
-        for (const playerId of Array.from(roomState.players.keys())) {
-            if (!roomSockets.has(playerId)) {
-                roomState.players.delete(playerId);
-                console.log(`Removed player ${playerId} from ${roomString}`)
+        await withAdmissionLock(async () => {
+            const result = await admit(socket, roomId.trim());
+            if (!result.ok) {
+                socket.emit('room_join_error', { code: 'room_full', roomId: roomId.trim() });
+                return;
             }
-        }
+            emitAssignment(socket, result.roomId, result.role, result.room);
+            if (!result.room.hasStarted) startRound(result.roomId, result.room);
+        });
+    });
 
-        if (!roomState.players.has(socket.id)) {
-            if (roomState.players.size === 0) {
-                roomState.players.set(socket.id, 'left');
-                socket.emit('player_side_assigned', 'left');
-                console.log(`ASSIGNED LEFT to ${socket.id}`);
-            } else if (roomState.players.size === 1) {
-                roomState.players.set(socket.id, 'right');
-                socket.emit('player_side_assigned', 'right')
-                console.log(`ASSIGNED RIGHT to ${socket.id}`);
-            } else {
-                console.log(`ROOM FULL: Acting as judge. (Implementing later...)`);
-                socket.emit('judge_assigned');
+    socket.on('find_match', async () => {
+        await withAdmissionLock(async () => {
+            // Descending count deliberately fills 4/5 before 3/5, etc.
+            const candidate = [...rooms.entries()]
+                .filter(([, room]) => room.members.size < ROOM_CAPACITY)
+                .sort(([, a], [, b]) => b.members.size - a.members.size)[0];
+            const roomId = candidate?.[0] ?? createRoom()[0];
+            const result = await admit(socket, roomId);
+            if (result.ok) {
+                emitAssignment(socket, result.roomId, result.role, result.room);
+                if (!result.room.hasStarted) startRound(result.roomId, result.room);
             }
-        } else {
-            const side = roomState.players.get(socket.id)!;
-            socket.emit('player_side_assigned', side);
-            console.log(`RE-SENT side: ${side} to ${socket.id}`);
-        };
+        });
+    });
 
-        socket.emit('room_state', {
-            left: { history: roomState.historyLeft, index: roomState.indexLeft },
-            right: { history: roomState.historyRight, index: roomState.indexRight },
-        })
+    socket.on('start_round', async (data: { room: string }) => {
+        await withAdmissionLock(() => {
+            const room = rooms.get(data?.room);
+            const role = room?.members.get(socket.id);
+            if (!room || (role !== 'left' && role !== 'right')) return;
+            startRound(data.room, room);
+        });
+    });
+
+    socket.on('cast_vote', (data: { room: string; vote: Vote }) => {
+        const room = rooms.get(data?.room);
+        if (!room || room.phase !== 'drawing' || room.roundEndsAt === null || Date.now() >= room.roundEndsAt) return;
+        if (room.members.get(socket.id) !== 'judge') return;
+        if (data.vote !== 'left' && data.vote !== 'right') return;
+
+        room.votes.set(socket.id, data.vote); // One current vote per judge; subsequent votes replace it.
+        const votesCast = room.votes.size;
+        io.to(data.room).emit('vote_status', { votesCast, eligibleVoters: [...room.members.values()].filter((role) => role === 'judge').length });
     });
 
     socket.on('draw', (data: { room: string; drawStroke: Stroke; side: 'left' | 'right' }) => {
         const roomState = rooms.get(data.room);
         if (!roomState) return;
+        if (roomState.phase !== 'drawing' || roomState.roundEndsAt === null || Date.now() >= roomState.roundEndsAt) return;
+        const role = roomState.members.get(socket.id);
+        if (role !== data.side) return;
 
         if (data.side === 'left') {
             roomState.historyLeft = roomState.historyLeft.slice(0, roomState.indexLeft + 1);
@@ -109,9 +286,10 @@ io.on('connection', (socket) => {
     socket.on('redo', (data: { room: string }) => {
         const roomState = rooms.get(data.room);
         if (!roomState) return;
+        if (roomState.phase !== 'drawing') return;
 
-        const side = roomState.players.get(socket.id);
-        if (!side) return;
+        const side = roomState.members.get(socket.id);
+        if (side !== 'left' && side !== 'right') return;
 
         if (side === 'left') {
             if (roomState.indexLeft + 1 < roomState.historyLeft.length) roomState.indexLeft += 1;
@@ -130,9 +308,10 @@ io.on('connection', (socket) => {
     socket.on('undo', (data: { room: string }) => {
         const roomState = rooms.get(data.room);
         if (!roomState) return;
+        if (roomState.phase !== 'drawing') return;
 
-        const side = roomState.players.get(socket.id);
-        if (!side) return;
+        const side = roomState.members.get(socket.id);
+        if (side !== 'left' && side !== 'right') return;
 
         if (side === 'left') {
             if (roomState.indexLeft >= 0) roomState.indexLeft -= 1;
@@ -150,17 +329,7 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         console.log(`User ${socket.id} disconnected.`)
-
-        rooms.forEach((roomState, roomId) => {
-            if (roomState.players.has(socket.id)) {
-                roomState.players.delete(socket.id);
-
-                if (roomState.players.size === 0) {
-                    rooms.delete(roomId);
-                    console.log(`--- Room ${roomId} closed (empty)`)
-                }
-            }
-        });
+        void withAdmissionLock(() => removeSocketFromRoom(socket));
     });
 });
 

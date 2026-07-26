@@ -137,12 +137,9 @@ export function News() {
 export default function Home(): JSX.Element {
     const navigate = useNavigate();
 
-    const makeRoomId = () => Math.floor(100000 + Math.random() * 900000).toString();
-
     const handleAutoJoin = () => {
-        const room = makeRoomId();
-        navigate(`/game/game_${room}`);
-        console.log(`/game/game_${room}`)
+        // The server selects the fullest room that still has capacity.
+        navigate('/game');
     }
 
     return (

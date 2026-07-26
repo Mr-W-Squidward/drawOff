@@ -15,10 +15,16 @@ export default function Game() {
   const canvasRightRef = useRef<HTMLCanvasElement>(null);
   const canvasStateLeftRef = useRef<CanvasState>({ history: [], historyIndex: -1, currentTool: 'brush' })
   const canvasStateRightRef = useRef<CanvasState>({ history: [], historyIndex: -1, currentTool: 'brush' })
-  const [leftVotes] = useState(0);
-  const [rightVotes] = useState(0);
+  const phaseRef = useRef<'lobby' | 'drawing' | 'results'>('lobby');
+  const [phase, setPhase] = useState<'lobby' | 'drawing' | 'results'>('lobby');
+  const [endsAt, setEndsAt] = useState<number | null>(null);
+  const [secondsRemaining, setSecondsRemaining] = useState(60);
+  const [leftVotes, setLeftVotes] = useState(0);
+  const [rightVotes, setRightVotes] = useState(0);
+  const [winner, setWinner] = useState<'left' | 'right' | 'tie' | null>(null);
+  const [votesCast, setVotesCast] = useState(0);
   const [showColourWheel, setShowColourWheel] = useState(false);
-  const [playerSide, setPlayerSide] = useState<'left' | 'right' | null>(null);
+  const [role, setRole] = useState<'left' | 'right' | 'judge' | null>(null);
   const [, forceUpdate] = useState({});
   const [roomId, setRoomId] = useState<string | null>(routeRoomId ?? null);
 
@@ -59,11 +65,31 @@ export default function Game() {
     const colour = e.target.value;
     brushColourRef.current = colour;
   }
+
+  function startRound() {
+    if ((role === 'left' || role === 'right') && roomIdRef.current) {
+      socketRef.current?.emit('start_round', { room: roomIdRef.current });
+    }
+  }
+
+  function castVote(vote: 'left' | 'right') {
+    if (role === 'judge' && phaseRef.current === 'drawing' && roomIdRef.current) {
+      socketRef.current?.emit('cast_vote', { room: roomIdRef.current, vote });
+    }
+  }
   
   
   // Canvas drawing refs -> add line width / colour wheel / socket.io later
   const [selectedWord] = useState(() => chooseRandomWord(wordList));
   const roomIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (phase !== 'drawing' || endsAt === null) return;
+    const updateTimer = () => setSecondsRemaining(Math.max(0, Math.ceil((endsAt - Date.now()) / 1000)));
+    updateTimer();
+    const timer = window.setInterval(updateTimer, 250);
+    return () => window.clearInterval(timer);
+  }, [phase, endsAt]);
 
   // Drawing with SOCKET.IO
   useEffect(() => {
@@ -71,18 +97,74 @@ export default function Game() {
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      const room = routeRoomId ?? null;
-      roomIdRef.current = room;
-      setRoomId(room);
-      console.log('✅ Connected to server:', socket.id, 'room:', room);
+      if (routeRoomId) {
+        roomIdRef.current = routeRoomId;
+        setRoomId(routeRoomId);
+        socket.emit('join_room', routeRoomId);
+      } else {
+        socket.emit('find_match');
+      }
+    });
 
-      socket.emit('join_room', room);
+    socket.on('room_assigned', (assignment: { roomId: string; role: 'left' | 'right' | 'judge' }) => {
+      roomIdRef.current = assignment.roomId;
+      setRoomId(assignment.roomId);
+      setRole(assignment.role);
+      if (assignment.role === 'judge') {
+        playerSideRef.current = null;
+      } else {
+        playerSideRef.current = assignment.role;
+      }
+    });
+
+    socket.on('round_status', (status: { phase: 'lobby' | 'drawing' | 'results'; endsAt: number | null }) => {
+      phaseRef.current = status.phase;
+      setPhase(status.phase);
+      setEndsAt(status.endsAt);
+    });
+
+    socket.on('round_started', (round: { endsAt: number }) => {
+      phaseRef.current = 'drawing';
+      setPhase('drawing');
+      setEndsAt(round.endsAt);
+      setSecondsRemaining(60);
+      setWinner(null);
+      setLeftVotes(0);
+      setRightVotes(0);
+      setVotesCast(0);
+    });
+
+    socket.on('round_timer', (timer: { remainingMs: number }) => {
+      setSecondsRemaining(Math.max(0, Math.ceil(timer.remainingMs / 1000)));
+    });
+
+    socket.on('vote_status', (status: { votesCast: number }) => setVotesCast(status.votesCast));
+
+    socket.on('round_ended', (result: { winner: 'left' | 'right' | 'tie'; leftVotes: number; rightVotes: number }) => {
+      phaseRef.current = 'results';
+      setPhase('results');
+      setEndsAt(null);
+      setSecondsRemaining(0);
+      setWinner(result.winner);
+      setLeftVotes(result.leftVotes);
+      setRightVotes(result.rightVotes);
+    });
+
+    socket.on('round_reset', () => {
+      phaseRef.current = 'lobby';
+      setPhase('lobby');
+      setEndsAt(null);
+      setSecondsRemaining(60);
+      setWinner(null);
+      setLeftVotes(0);
+      setRightVotes(0);
+      setVotesCast(0);
     });
 
     socket.on('player_side_assigned', (side: 'left' | 'right') => {
       console.log('🎯 player_side_assigned received:', side);
       playerSideRef.current = side;
-      setPlayerSide(side);
+      setRole(side);
       forceUpdate({});
     });
 
@@ -140,6 +222,7 @@ export default function Game() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey || e.metaKey) {
+        if (phaseRef.current !== 'drawing') return;
         if (e.key === 'z') {
           e.preventDefault()
           
@@ -207,7 +290,7 @@ export default function Game() {
 
       const onMouseDown = (event: MouseEvent) => {
         const isLeftCanvas = canvas.id === 'canvasLeft';
-        if (playerSideRef.current && playerSideRef.current !== (isLeftCanvas ? 'left' : 'right')) {
+        if (phaseRef.current !== 'drawing' || playerSideRef.current !== (isLeftCanvas ? 'left' : 'right')) {
           return;
         }
 
@@ -327,10 +410,16 @@ export default function Game() {
             {/* Player Info */}
             <div className="text-white text-sm">
               <div>Room: <span className="font-mono text-yellow-400">{roomId || 'Connecting...'}</span></div>
-              <div>Side: <span className={`font-bold ${playerSide === 'left' ? 'text-blue-400' : playerSide === 'right' ? 'text-red-400' : 'text-gray-400'}`}>
-                {playerSide ? playerSide.toUpperCase() : 'Waiting...'}
+              <div>Role: <span className={`font-bold ${role === 'left' ? 'text-blue-400' : role === 'right' ? 'text-red-400' : 'text-gray-400'}`}>
+                {role ? role.toUpperCase() : 'Waiting...'}
               </span>
               </div>
+            </div>
+
+            <div className="text-center text-white">
+              <div className="text-xs uppercase text-gray-400">{phase}</div>
+              <div className="font-mono text-2xl">{phase === 'drawing' ? `0:${secondsRemaining.toString().padStart(2, '0')}` : phase === 'results' ? 'Round complete' : 'Lobby'}</div>
+              {role === 'judge' && phase === 'drawing' && <div className="text-xs text-gray-400">Votes cast: {votesCast}</div>}
             </div>
 
             <div className="flex justify-center items-center gap-6">
@@ -392,6 +481,30 @@ export default function Game() {
               {selectedWord}
             </span>
           </h1>
+
+          {phase === 'lobby' && (
+            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/50">
+              {(role === 'left' || role === 'right') ? (
+                <button className="rounded bg-blue-600 px-6 py-3 font-bold text-white hover:bg-blue-500" onClick={startRound}>Start Round</button>
+              ) : <p className="rounded bg-[#1a1a1a] p-4 text-white">Waiting for the drawers to start the round…</p>}
+            </div>
+          )}
+
+          {phase === 'results' && (
+            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/60 text-center text-white">
+              <div className="rounded border border-gray-500 bg-[#1a1a1a] p-8">
+                <p className="text-sm uppercase text-gray-400">Round winner</p>
+                <p className="mt-2 text-3xl font-bold">{winner === 'tie' ? 'It’s a tie!' : `${winner?.toUpperCase()} wins!`}</p>
+              </div>
+            </div>
+          )}
+
+          {role === 'judge' && phase === 'drawing' && (
+            <div className="absolute bottom-4 left-1/2 z-20 flex -translate-x-1/2 gap-3 rounded bg-[#1a1a1a] p-3 text-white">
+              <button className="rounded bg-blue-700 px-4 py-2 hover:bg-blue-500" onClick={() => castVote('left')}>Vote Left</button>
+              <button className="rounded bg-red-700 px-4 py-2 hover:bg-red-500" onClick={() => castVote('right')}>Vote Right</button>
+            </div>
+          )}
 
           {/* Canvas Wrapper */}
           <div className="flex flex-1 relative">
