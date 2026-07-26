@@ -2,22 +2,102 @@ import express from 'express';
 import { createServer } from 'node:http';
 import { Server, type Socket } from 'socket.io';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { randomUUID } from 'node:crypto';
 import type { Stroke } from '../src/types/canvas.types.ts';
 import { db, initDb } from './db.ts';
+import { logSecurityEvent } from './logger.ts';
+import {
+    SocketRateLimiter,
+    sanitizeRoomId,
+    sanitizeSessionId,
+    sanitizeStroke,
+} from './security.ts';
 
 const PORT = Number(process.env.PORT ?? 5174);
+
+// Allow-list of origins permitted to call the API / connect over websockets.
+// Override in production via CORS_ORIGIN (comma-separated).
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGIN ?? 'http://localhost:5173')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// Trust the first proxy hop so rate limiting keys off the real client IP
+// when running behind a reverse proxy / load balancer.
+app.set('trust proxy', 1);
+
+// Security headers (CSP, HSTS, no-sniff, frameguard, etc.).
+app.use(helmet());
+
+// Lock CORS down to the known frontend origin(s) instead of allowing all.
+app.use(
+    cors({
+        origin: ALLOWED_ORIGINS,
+        methods: ['GET', 'POST'],
+    })
+);
+
+// Cap request body size to blunt memory-exhaustion / payload-flood attacks.
+app.use(express.json({ limit: '16kb' }));
+
+// Global HTTP rate limiter applied to every API route.
+const apiLimiter = rateLimit({
+    windowMs: 60_000, // 1 minute
+    limit: 120, // 120 requests / minute / IP
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => {
+        logSecurityEvent({
+            event: 'http_rate_limit',
+            severity: 'warn',
+            source: req.ip,
+            details: { method: req.method, path: req.originalUrl },
+        });
+        res.status(429).json({ ok: false, error: 'too many requests' });
+    },
+});
+app.use('/api', apiLimiter);
 
 const server = createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: 'http://localhost:5173',
-        methods: ["GET", "POST"]
-    }
+        origin: ALLOWED_ORIGINS,
+        methods: ['GET', 'POST'],
+    },
+    maxHttpBufferSize: 1e6, // 1 MB cap on any single socket message.
 });
+
+// Per-socket event rate limits (token bucket). "draw" is high-frequency during
+// a round, so it gets a generous allowance; lobby/control events are strict.
+const socketLimiter = new SocketRateLimiter({
+    join_room: { ratePerSec: 2, burst: 5 },
+    find_match: { ratePerSec: 2, burst: 5 },
+    start_round: { ratePerSec: 1, burst: 3 },
+    cast_vote: { ratePerSec: 5, burst: 10 },
+    draw: { ratePerSec: 120, burst: 240 },
+    undo: { ratePerSec: 10, burst: 20 },
+    redo: { ratePerSec: 10, burst: 20 },
+    default: { ratePerSec: 20, burst: 40 },
+});
+
+/**
+ * Guard a socket event: enforces the rate limit and logs abuse.
+ * Returns true when the handler should proceed.
+ */
+function allowSocketEvent(socket: Socket, event: string): boolean {
+    if (socketLimiter.allow(socket.id, event)) return true;
+    logSecurityEvent({
+        event: 'socket_rate_limit',
+        severity: 'warn',
+        source: socket.id,
+        details: { socketEvent: event, address: socket.handshake.address },
+    });
+    return false;
+}
 
 const ROOM_CAPACITY = 5;
 const ROUND_DURATION_MS = 60_000;
@@ -205,14 +285,21 @@ io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`)
 
     socket.on('join_room', async (roomId: unknown) => {
-        if (typeof roomId !== 'string' || !roomId.trim()) {
+        if (!allowSocketEvent(socket, 'join_room')) return;
+        const cleanRoomId = sanitizeRoomId(roomId);
+        if (!cleanRoomId) {
+            logSecurityEvent({
+                event: 'invalid_input',
+                source: socket.id,
+                details: { socketEvent: 'join_room', reason: 'invalid_room_id' },
+            });
             socket.emit('room_join_error', { code: 'invalid_room' });
             return;
         }
         await withAdmissionLock(async () => {
-            const result = await admit(socket, roomId.trim());
+            const result = await admit(socket, cleanRoomId);
             if (!result.ok) {
-                socket.emit('room_join_error', { code: 'room_full', roomId: roomId.trim() });
+                socket.emit('room_join_error', { code: 'room_full', roomId: cleanRoomId });
                 return;
             }
             emitAssignment(socket, result.roomId, result.role, result.room);
@@ -221,6 +308,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('find_match', async () => {
+        if (!allowSocketEvent(socket, 'find_match')) return;
         await withAdmissionLock(async () => {
             // Descending count deliberately fills 4/5 before 3/5, etc.
             const candidate = [...rooms.entries()]
@@ -236,27 +324,47 @@ io.on('connection', (socket) => {
     });
 
     socket.on('start_round', async (data: { room: string }) => {
+        if (!allowSocketEvent(socket, 'start_round')) return;
+        const cleanRoomId = sanitizeRoomId(data?.room);
+        if (!cleanRoomId) return;
         await withAdmissionLock(() => {
-            const room = rooms.get(data?.room);
+            const room = rooms.get(cleanRoomId);
             const role = room?.members.get(socket.id);
             if (!room || (role !== 'left' && role !== 'right')) return;
-            startRound(data.room, room);
+            startRound(cleanRoomId, room);
         });
     });
 
     socket.on('cast_vote', (data: { room: string; vote: Vote }) => {
-        const room = rooms.get(data?.room);
+        if (!allowSocketEvent(socket, 'cast_vote')) return;
+        const cleanRoomId = sanitizeRoomId(data?.room);
+        if (!cleanRoomId) return;
+        const room = rooms.get(cleanRoomId);
         if (!room || room.phase !== 'drawing' || room.roundEndsAt === null || Date.now() >= room.roundEndsAt) return;
         if (room.members.get(socket.id) !== 'judge') return;
         if (data.vote !== 'left' && data.vote !== 'right') return;
 
         room.votes.set(socket.id, data.vote); // One current vote per judge; subsequent votes replace it.
         const votesCast = room.votes.size;
-        io.to(data.room).emit('vote_status', { votesCast, eligibleVoters: [...room.members.values()].filter((role) => role === 'judge').length });
+        io.to(cleanRoomId).emit('vote_status', { votesCast, eligibleVoters: [...room.members.values()].filter((role) => role === 'judge').length });
     });
 
     socket.on('draw', (data: { room: string; drawStroke: Stroke; side: 'left' | 'right' }) => {
-        const roomState = rooms.get(data.room);
+        if (!allowSocketEvent(socket, 'draw')) return;
+        const cleanRoomId = sanitizeRoomId(data?.room);
+        if (!cleanRoomId) return;
+        if (data?.side !== 'left' && data?.side !== 'right') return;
+        const stroke = sanitizeStroke(data?.drawStroke);
+        if (!stroke) {
+            logSecurityEvent({
+                event: 'invalid_input',
+                source: socket.id,
+                details: { socketEvent: 'draw', reason: 'invalid_stroke' },
+            });
+            return;
+        }
+
+        const roomState = rooms.get(cleanRoomId);
         if (!roomState) return;
         if (roomState.phase !== 'drawing' || roomState.roundEndsAt === null || Date.now() >= roomState.roundEndsAt) return;
         const role = roomState.members.get(socket.id);
@@ -264,27 +372,30 @@ io.on('connection', (socket) => {
 
         if (data.side === 'left') {
             roomState.historyLeft = roomState.historyLeft.slice(0, roomState.indexLeft + 1);
-            roomState.historyLeft.push(data.drawStroke);
+            roomState.historyLeft.push(stroke);
             roomState.indexLeft = roomState.historyLeft.length - 1;
         } else {
             roomState.historyRight = roomState.historyRight.slice(0, roomState.indexRight + 1);
-            roomState.historyRight.push(data.drawStroke);
+            roomState.historyRight.push(stroke);
             roomState.indexRight = roomState.historyRight.length - 1;
         }
 
-        socket.to(data.room).emit('opponent_draw', {
+        socket.to(cleanRoomId).emit('opponent_draw', {
             side: data.side,
-            stroke: data.drawStroke,
+            stroke,
         });
 
-        io.to(data.room).emit('room_state', {
+        io.to(cleanRoomId).emit('room_state', {
             left: { history: roomState.historyLeft, index: roomState.indexLeft },
             right: { history: roomState.historyRight, index: roomState.indexRight },
         });
     });
 
     socket.on('redo', (data: { room: string }) => {
-        const roomState = rooms.get(data.room);
+        if (!allowSocketEvent(socket, 'redo')) return;
+        const cleanRoomId = sanitizeRoomId(data?.room);
+        if (!cleanRoomId) return;
+        const roomState = rooms.get(cleanRoomId);
         if (!roomState) return;
         if (roomState.phase !== 'drawing') return;
 
@@ -297,16 +408,19 @@ io.on('connection', (socket) => {
             if (roomState.indexRight + 1 < roomState.historyRight.length) roomState.indexRight += 1;
         }
 
-        socket.to(data.room).emit('redo', data);
+        socket.to(cleanRoomId).emit('redo', { room: cleanRoomId });
 
-        io.to(data.room).emit('room_state', {
+        io.to(cleanRoomId).emit('room_state', {
             left: { history: roomState.historyLeft, index: roomState.indexLeft },
             right: { history: roomState.historyRight, index: roomState.indexRight },
         });
     });
 
     socket.on('undo', (data: { room: string }) => {
-        const roomState = rooms.get(data.room);
+        if (!allowSocketEvent(socket, 'undo')) return;
+        const cleanRoomId = sanitizeRoomId(data?.room);
+        if (!cleanRoomId) return;
+        const roomState = rooms.get(cleanRoomId);
         if (!roomState) return;
         if (roomState.phase !== 'drawing') return;
 
@@ -319,9 +433,9 @@ io.on('connection', (socket) => {
             if (roomState.indexRight >= 0) roomState.indexRight -= 1;
         }
 
-        socket.to(data.room).emit('undo', data);
+        socket.to(cleanRoomId).emit('undo', { room: cleanRoomId });
 
-        io.to(data.room).emit('room_state', {
+        io.to(cleanRoomId).emit('room_state', {
             left: { history: roomState.historyLeft, index: roomState.indexLeft },
             right: { history: roomState.historyRight, index: roomState.indexRight },
         });
@@ -329,6 +443,7 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         console.log(`User ${socket.id} disconnected.`)
+        socketLimiter.clear(socket.id);
         void withAdmissionLock(() => removeSocketFromRoom(socket));
     });
 });
@@ -395,8 +510,15 @@ async function pruneInactive() {
 }
 
 router.post("/api/stats/visit", async (req, res) => {
-    const sessionId = req.body?.sessionId ?? req.query?.sessionId;
-    if (!sessionId) return res.status(400).json({ ok: false, error: "missing sessionId" });
+    const sessionId = sanitizeSessionId(req.body?.sessionId ?? req.query?.sessionId);
+    if (!sessionId) {
+        logSecurityEvent({
+            event: 'invalid_input',
+            source: req.ip,
+            details: { path: '/api/stats/visit', reason: 'invalid_session_id' },
+        });
+        return res.status(400).json({ ok: false, error: "missing or invalid sessionId" });
+    }
 
     await pruneInactive();
 
@@ -428,8 +550,15 @@ router.post("/api/stats/visit", async (req, res) => {
 });
 
 router.post("/api/stats/heartbeat", async (req, res) => {
-    const sessionId = req.body?.sessionId ?? req.query?.sessionId;
-    if (!sessionId) return res.status(400).json(await getStats());
+    const sessionId = sanitizeSessionId(req.body?.sessionId ?? req.query?.sessionId);
+    if (!sessionId) {
+        logSecurityEvent({
+            event: 'invalid_input',
+            source: req.ip,
+            details: { path: '/api/stats/heartbeat', reason: 'invalid_session_id' },
+        });
+        return res.status(400).json(await getStats());
+    }
 
     const now = Date.now();
     const rowRes = await db.execute(
@@ -477,8 +606,15 @@ router.post("/api/stats/heartbeat", async (req, res) => {
 });
 
 router.post("/api/stats/session/end", async (req, res) => {
-    const sessionId = req.body?.sessionId ?? req.query?.sessionId;
-    if (!sessionId) return res.status(400).json(await getStats());
+    const sessionId = sanitizeSessionId(req.body?.sessionId ?? req.query?.sessionId);
+    if (!sessionId) {
+        logSecurityEvent({
+            event: 'invalid_input',
+            source: req.ip,
+            details: { path: '/api/stats/session/end', reason: 'invalid_session_id' },
+        });
+        return res.status(400).json(await getStats());
+    }
 
     const now = Date.now();
     const rowRes = await db.execute(
@@ -522,6 +658,29 @@ router.get("/api/stats", async (req, res) => {
 });
 
 app.use(router);
+
+// Unknown routes: log and return a generic 404 (no route enumeration hints).
+app.use((req, res) => {
+    logSecurityEvent({
+        event: 'not_found',
+        severity: 'info',
+        source: req.ip,
+        details: { method: req.method, path: req.originalUrl },
+    });
+    res.status(404).json({ ok: false, error: 'not found' });
+});
+
+// Central error handler: log the real error server-side, return a generic
+// message to the client so stack traces / internals are never leaked.
+app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    logSecurityEvent({
+        event: 'unhandled_error',
+        severity: 'alert',
+        source: req.ip,
+        details: { path: req.originalUrl, message: err instanceof Error ? err.message : String(err) },
+    });
+    res.status(500).json({ ok: false, error: 'internal server error' });
+});
 
 (async () => {
     try {

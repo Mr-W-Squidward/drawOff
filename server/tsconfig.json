@@ -1,5 +1,8 @@
 {
   // Visit https://aka.ms/tsconfig to read more about this file
+  "ts-node": {
+    "transpileOnly": true
+  },
   "compilerOptions": {
     // File Layout
     // "rootDir": "./src",
