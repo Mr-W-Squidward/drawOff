@@ -377,20 +377,21 @@ async function pruneInactive() {
         totalAdd += deltaSec;
     }
 
-    await db.execute("BEGIN");
-    try {
-        if (totalAdd > 0) {
-            await db.execute(
-                `UPDATE stats SET total_playtime_seconds = total_playtime_seconds + ? WHERE id = ?`,
-                [totalAdd, 1]
-            );
-        }
-        await db.execute(`DELETE FROM sessions WHERE last_seen_at < ?`, [cutoff]);
-        await db.execute("COMMIT");
-    } catch (err) {
-        await db.execute("ROLLBACK");
-        throw err;
+    const batch: { sql: string; args?: any[] }[] = [];
+
+    if (totalAdd > 0) {
+        batch.push({
+            sql: `UPDATE stats SET total_playtime_seconds = total_playtime_seconds + ? WHERE id = ?`,
+            args: [totalAdd, 1],
+        });
     }
+
+    batch.push({
+        sql: `DELETE FROM sessions WHERE last_seen_at < ?`,
+        args: [cutoff],
+    });
+
+    await db.batch(batch); // atomic, no manual rollback needed
 }
 
 router.post("/api/stats/visit", async (req, res) => {
@@ -408,19 +409,18 @@ router.post("/api/stats/visit", async (req, res) => {
     }
 
     const now = Date.now();
-    await db.execute("BEGIN");
     try {
-        await db.execute(
-            `INSERT INTO sessions (session_id, started_at, last_seen_at) VALUES (?, ?, ?)`,
-            [sessionId, now, now]
-        );
-        await db.execute(
-            `UPDATE stats SET visits = visits + 1 WHERE id = ?`,
-            [1]
-        );
-        await db.execute("COMMIT");
+        await db.batch([
+            {
+                sql: `INSERT INTO sessions (session_id, started_at, last_seen_at) VALUES (?, ?, ?)`,
+                args: [sessionId, now, now],
+            },
+            {
+                sql: `UPDATE stats SET visits = visits + 1 WHERE id = ?`,
+                args: [1],
+            },
+        ]);
     } catch {
-        await db.execute("ROLLBACK");
         return res.status(500).json({ ok: false, error: "db error" });
     }
 
@@ -451,19 +451,18 @@ router.post("/api/stats/heartbeat", async (req, res) => {
     const deltaSeconds = Math.max(0, Math.floor((now - lastSeen) / 1000));
 
     if (deltaSeconds > 0) {
-        await db.execute("BEGIN");
         try {
-            await db.execute(
-                `UPDATE sessions SET last_seen_at = ? WHERE session_id = ?`,
-                [now, sessionId]
-            );
-            await db.execute(
-                `UPDATE stats SET total_playtime_seconds = total_playtime_seconds + ? WHERE id = ?`,
-                [deltaSeconds, 1]
-            );
-            await db.execute("COMMIT");
+            await db.batch([
+                {
+                    sql: `UPDATE sessions SET last_seen_at = ? WHERE session_id = ?`,
+                    args: [now, sessionId],
+                },
+                {
+                    sql: `UPDATE stats SET total_playtime_seconds = total_playtime_seconds + ? WHERE id = ?`,
+                    args: [deltaSeconds, 1],
+                },
+            ]);
         } catch {
-            await db.execute("ROLLBACK");
             return res.status(500).json({ ok: false, error: "db error" });
         }
     } else {
@@ -496,18 +495,20 @@ router.post("/api/stats/session/end", async (req, res) => {
     const lastSeen = Number(row.last_seen_at ?? 0);
     const deltaSeconds = Math.max(0, Math.floor((now - lastSeen) / 1000));
 
-    await db.execute("BEGIN");
     try {
+        const batch: { sql: string; args: any[] }[] = [];
         if (deltaSeconds > 0) {
-            await db.execute(
-                `UPDATE stats SET total_playtime_seconds = total_playtime_seconds + ? WHERE id = ?`,
-                [deltaSeconds, 1]
-            );
+            batch.push({
+                sql: `UPDATE stats SET total_playtime_seconds = total_playtime_seconds + ? WHERE id = ?`,
+                args: [deltaSeconds, 1],
+            });
         }
-        await db.execute(`DELETE FROM sessions WHERE session_id = ?`, [sessionId]);
-        await db.execute("COMMIT");
+        batch.push({
+            sql: `DELETE FROM sessions WHERE session_id = ?`,
+            args: [sessionId],
+        });
+        await db.batch(batch);
     } catch {
-        await db.execute("ROLLBACK");
         return res.status(500).json({ ok: false, error: "db error" });
     }
 

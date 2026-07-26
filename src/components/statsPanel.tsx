@@ -100,10 +100,13 @@ export function StatsPanel() {
     }, []);
 
     return (
-        <div>
-            <p>Visits: {stats.visits}</p>
-            <p>Active Users: {stats.activeUsers}</p>
-            <p>Total Playtime: {stats.totalPlaytimeSeconds}s</p>
+        <div className="h-40 w-48 rounded-lg border border-white/20 bg-[#2c2a3d] p-3 text-left text-white">
+            <h4 className="mb-3 text-center text-sm font-bold">Live Stats</h4>
+            <div className="space-y-2 text-xs text-gray-200">
+                <p className="flex justify-between"><span>Visits</span><span className="font-semibold text-white">{stats.visits}</span></p>
+                <p className="flex justify-between"><span>Active now</span><span className="font-semibold text-white">{stats.activeUsers}</span></p>
+                <p className="flex justify-between"><span>Playtime</span><span className="font-semibold text-white">{stats.totalPlaytimeSeconds}s</span></p>
+            </div>
         </div>
     );
 }

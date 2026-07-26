@@ -1,7 +1,8 @@
 import { Link, useNavigate } from "react-router-dom"
-import { useState, type JSX } from "react"
+import { useEffect, useState, type JSX } from "react"
 import { ChevronLeft, ChevronRight } from "lucide-react"
 import { StatsPanel } from "../components/statsPanel";
+import { audioManager } from "../utils/audioManager";
 
 const TUTORIAL = [
     {
@@ -137,8 +138,22 @@ export function News() {
 export default function Home(): JSX.Element {
     const navigate = useNavigate();
 
+    useEffect(() => {
+        audioManager.preload();
+        audioManager.startHomeBgm();
+        const unlockBgm = () => audioManager.startHomeBgm();
+        window.addEventListener('pointerdown', unlockBgm, { once: true });
+        window.addEventListener('keydown', unlockBgm, { once: true });
+        return () => {
+            window.removeEventListener('pointerdown', unlockBgm);
+            window.removeEventListener('keydown', unlockBgm);
+            audioManager.stopHomeBgm();
+        };
+    }, []);
+
     const handleAutoJoin = () => {
         // The server selects the fullest room that still has capacity.
+        audioManager.play('navigate');
         navigate('/game');
     }
 
@@ -174,11 +189,11 @@ export default function Home(): JSX.Element {
                         </button>
                     </div>
                     
-                    <Link to="/create">
+                    <Link to="/create" onClick={() => audioManager.play('navigate')}>
                         <button className="cursor-pointer border-4 border-double bg-blue-600 px-4 py-2 text-white rounded">Create Lobby</button>
                     </Link>
 
-                    <Link to="/join">
+                    <Link to="/join" onClick={() => audioManager.play('navigate')}>
                         <button className="cursor-pointer border-4 border-double bg-blue-600 px-4 py-2 text-white rounded">Join Lobby</button>
                     </Link>
                     
