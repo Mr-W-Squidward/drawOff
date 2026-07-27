@@ -1,6 +1,5 @@
 import { Link, useNavigate } from "react-router-dom"
-import { useEffect, useState, type JSX } from "react"
-import { ChevronLeft, ChevronRight } from "lucide-react"
+import { useEffect, type JSX } from "react"
 import { StatsPanel } from "../components/statsPanel";
 import { HowToPlay } from "../components/tutorial"
 import { News } from "../components/news";

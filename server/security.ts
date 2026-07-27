@@ -1,4 +1,4 @@
-import type { Stroke } from '../src/types/canvas.types.ts';
+import type { Stroke } from '../src/types/canvas.types.js';
 
 /**
  * Input validation / sanitization helpers and a small in-memory rate limiter

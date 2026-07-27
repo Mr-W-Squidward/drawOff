@@ -1,7 +1,8 @@
 {
   // Visit https://aka.ms/tsconfig to read more about this file
   "ts-node": {
-    "transpileOnly": true
+    "transpileOnly": true,
+    "experimentalResolver": true
   },
   "compilerOptions": {
     // File Layout
@@ -12,7 +13,7 @@
     // See also https://aka.ms/tsconfig/module
     "module": "nodenext",
     "target": "esnext",
-    "allowImportingTsExtensions": true,
+    "noEmit": true,
     "types": [],
     // For nodejs:
     // "lib": ["esnext"],

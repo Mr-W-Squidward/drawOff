@@ -5,15 +5,15 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { randomUUID } from 'node:crypto';
-import type { Stroke } from '../src/types/canvas.types.ts';
-import { db, initDb } from './db.ts';
-import { logSecurityEvent } from './logger.ts';
+import type { Stroke } from '../src/types/canvas.types.js';
+import { db, initDb } from './db.js';
+import { logSecurityEvent } from './logger.js';
 import {
     SocketRateLimiter,
     sanitizeRoomId,
     sanitizeSessionId,
     sanitizeStroke,
-} from './security.ts';
+} from './security.js';
 
 const PORT = Number(process.env.PORT ?? 5174);
 
