@@ -10,6 +10,7 @@ import { db, initDb } from './db.js';
 import { logSecurityEvent } from './logger.js';
 import {
     SocketRateLimiter,
+    sanitizeClientId,
     sanitizeRoomId,
     sanitizeSessionId,
     sanitizeStroke,
@@ -114,6 +115,9 @@ interface RoomState {
     indexRight: number;
     phase: RoundPhase;
     roundEndsAt: number | null;
+    /** Keyed by the reconnect-stable clientId (not socket.id) so a judge who
+     * reloads their tab is recognised as the same voter instead of getting a
+     * fresh vote slot under their new socket. */
     votes: Map<string, Vote>;
     hasStarted: boolean;
     endTimer: NodeJS.Timeout | undefined;
@@ -122,6 +126,10 @@ interface RoomState {
 
 const rooms = new Map<string, RoomState>();
 const socketRooms = new Map<string, string>();
+// Maps the live socket.id to the browser-persisted clientId supplied on
+// join, so events on this connection (e.g. cast_vote) can be attributed to
+// a stable identity that survives a page reload.
+const socketClientIds = new Map<string, string>();
 
 // Socket.IO handlers may be async and adapters can make room operations async.
 // Serialising admission keeps "find a room" and "reserve its final slot" atomic.
@@ -224,6 +232,7 @@ function startRound(roomId: string, room: RoomState) {
 
 async function removeSocketFromRoom(socket: Socket) {
     const roomId = socketRooms.get(socket.id);
+    socketClientIds.delete(socket.id);
     if (!roomId) return;
 
     socketRooms.delete(socket.id);
@@ -238,7 +247,7 @@ async function removeSocketFromRoom(socket: Socket) {
     }
 }
 
-async function admit(socket: Socket, roomId: string) {
+async function admit(socket: Socket, roomId: string, clientId: string | null) {
     const room = rooms.get(roomId) ?? createRoom(roomId)[1];
     const existingRole = room.members.get(socket.id);
     if (existingRole) return { ok: true as const, roomId, role: existingRole, room };
@@ -248,11 +257,13 @@ async function admit(socket: Socket, roomId: string) {
     const role = roleForRoom(room);
     room.members.set(socket.id, role); // Reserve before yielding to the adapter.
     socketRooms.set(socket.id, roomId);
+    if (clientId) socketClientIds.set(socket.id, clientId);
     try {
         await socket.join(roomId);
     } catch (error) {
         room.members.delete(socket.id);
         socketRooms.delete(socket.id);
+        socketClientIds.delete(socket.id);
         if (room.members.size === 0) {
             clearRoundTimers(room);
             rooms.delete(roomId);
@@ -284,9 +295,14 @@ function emitAssignment(socket: Socket, roomId: string, role: RoomRole, room: Ro
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`)
 
-    socket.on('join_room', async (roomId: unknown) => {
+    socket.on('join_room', async (data: unknown) => {
         if (!allowSocketEvent(socket, 'join_room')) return;
-        const cleanRoomId = sanitizeRoomId(roomId);
+        // Accept either the legacy bare-roomId payload or { roomId, clientId }.
+        const isObjectPayload = typeof data === 'object' && data !== null;
+        const rawRoomId = isObjectPayload ? (data as { roomId?: unknown }).roomId : data;
+        const rawClientId = isObjectPayload ? (data as { clientId?: unknown }).clientId : undefined;
+        const cleanRoomId = sanitizeRoomId(rawRoomId);
+        const clientId = sanitizeClientId(rawClientId);
         if (!cleanRoomId) {
             logSecurityEvent({
                 event: 'invalid_input',
@@ -297,7 +313,7 @@ io.on('connection', (socket) => {
             return;
         }
         await withAdmissionLock(async () => {
-            const result = await admit(socket, cleanRoomId);
+            const result = await admit(socket, cleanRoomId, clientId);
             if (!result.ok) {
                 socket.emit('room_join_error', { code: 'room_full', roomId: cleanRoomId });
                 return;
@@ -307,15 +323,18 @@ io.on('connection', (socket) => {
         });
     });
 
-    socket.on('find_match', async () => {
+    socket.on('find_match', async (data?: unknown) => {
         if (!allowSocketEvent(socket, 'find_match')) return;
+        const clientId = sanitizeClientId(
+            typeof data === 'object' && data !== null ? (data as { clientId?: unknown }).clientId : undefined
+        );
         await withAdmissionLock(async () => {
             // Descending count deliberately fills 4/5 before 3/5, etc.
             const candidate = [...rooms.entries()]
                 .filter(([, room]) => room.members.size < ROOM_CAPACITY)
                 .sort(([, a], [, b]) => b.members.size - a.members.size)[0];
             const roomId = candidate?.[0] ?? createRoom()[0];
-            const result = await admit(socket, roomId);
+            const result = await admit(socket, roomId, clientId);
             if (result.ok) {
                 emitAssignment(socket, result.roomId, result.role, result.room);
                 if (!result.room.hasStarted) startRound(result.roomId, result.room);
@@ -344,7 +363,11 @@ io.on('connection', (socket) => {
         if (room.members.get(socket.id) !== 'judge') return;
         if (data.vote !== 'left' && data.vote !== 'right') return;
 
-        room.votes.set(socket.id, data.vote); // One current vote per judge; subsequent votes replace it.
+        // Key by the reconnect-stable clientId (falling back to socket.id for
+        // clients that never sent one) so a judge who reloads and rejoins
+        // under a new socket.id still only ever holds one vote in this round.
+        const voterKey = socketClientIds.get(socket.id) ?? socket.id;
+        room.votes.set(voterKey, data.vote); // One current vote per judge; subsequent votes replace it.
         const votesCast = room.votes.size;
         io.to(cleanRoomId).emit('vote_status', { votesCast, eligibleVoters: [...room.members.values()].filter((role) => role === 'judge').length });
     });

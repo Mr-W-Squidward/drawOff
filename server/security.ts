@@ -36,6 +36,21 @@ export function sanitizeRoomId(value: unknown): string | null {
     return trimmed;
 }
 
+/**
+ * Client ids are a browser-persisted (localStorage) identity used to
+ * recognise the same physical participant across a socket reconnect (e.g. a
+ * page reload), so per-round state like judge votes survives the reconnect
+ * instead of being granted a fresh vote slot.
+ */
+const CLIENT_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+export function sanitizeClientId(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!CLIENT_ID_RE.test(trimmed)) return null;
+    return trimmed;
+}
+
 // ---------------------------------------------------------------------------
 // Drawing payload validation
 // ---------------------------------------------------------------------------

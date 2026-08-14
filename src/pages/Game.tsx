@@ -83,6 +83,17 @@ export default function Game() {
   const [selectedWord] = useState(() => chooseRandomWord(wordList));
   const roomIdRef = useRef<string | null>(null);
 
+  // A clientId persisted in localStorage identifies this browser across a
+  // socket reconnect (e.g. a page reload), so the server can recognise a
+  // returning judge as the same voter instead of granting a fresh vote slot.
+  const clientIdRef = useRef<string>((() => {
+    const stored = localStorage.getItem('clientId');
+    if (stored) return stored;
+    const generated = crypto.randomUUID();
+    localStorage.setItem('clientId', generated);
+    return generated;
+  })());
+
   useEffect(() => {
     if (phase !== 'drawing' || endsAt === null) return;
     const updateTimer = () => setSecondsRemaining(Math.max(0, Math.ceil((endsAt - Date.now()) / 1000)));
@@ -100,9 +111,9 @@ export default function Game() {
       if (routeRoomId) {
         roomIdRef.current = routeRoomId;
         setRoomId(routeRoomId);
-        socket.emit('join_room', routeRoomId);
+        socket.emit('join_room', { roomId: routeRoomId, clientId: clientIdRef.current });
       } else {
-        socket.emit('find_match');
+        socket.emit('find_match', { clientId: clientIdRef.current });
       }
     });
 
