@@ -6,7 +6,11 @@
   },
   "compilerOptions": {
     // File Layout
-    // "rootDir": "./src",
+    // Server code imports a couple of shared modules from ../src (e.g. the
+    // word list used for server-side prompt selection), so the common source
+    // directory is the repo root. TS 6 requires rootDir to be explicit in
+    // that case; it has no effect on output here since noEmit is set.
+    "rootDir": "..",
     // "outDir": "./dist",
 
     // Environment Settings

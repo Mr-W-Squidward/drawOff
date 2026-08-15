@@ -2,7 +2,6 @@ import { useRef, useEffect, useState, type RefObject } from "react";
 import { io, Socket } from 'socket.io-client';
 import type { Stroke, CanvasState } from '../types/canvas.types';
 import { redrawCanvas } from '../utils/canvasUtils'
-import wordList, { chooseRandomWord } from '../constants/constants'
 import { useParams } from "react-router-dom";
 
 export default function Game() {
@@ -22,6 +21,11 @@ export default function Game() {
   const [leftVotes, setLeftVotes] = useState(0);
   const [rightVotes, setRightVotes] = useState(0);
   const [winner, setWinner] = useState<'left' | 'right' | 'tie' | null>(null);
+  const [leftScore, setLeftScore] = useState<number | null>(null);
+  const [rightScore, setRightScore] = useState<number | null>(null);
+  const [leftReasoning, setLeftReasoning] = useState<string | null>(null);
+  const [rightReasoning, setRightReasoning] = useState<string | null>(null);
+  const [aiError, setAiError] = useState<string | null>(null);
   const [votesCast, setVotesCast] = useState(0);
   const [showColourWheel, setShowColourWheel] = useState(false);
   const [role, setRole] = useState<'left' | 'right' | 'judge' | null>(null);
@@ -79,8 +83,10 @@ export default function Game() {
   }
   
   
-  // Canvas drawing refs -> add line width / colour wheel / socket.io later
-  const [selectedWord] = useState(() => chooseRandomWord(wordList));
+  // The prompt is chosen by the server and broadcast in round_started /
+  // round_status, so both drawers (and the AI judge) share one authoritative
+  // word instead of each client picking its own.
+  const [promptText, setPromptText] = useState<string | null>(null);
   const roomIdRef = useRef<string | null>(null);
 
   // A clientId persisted in localStorage identifies this browser across a
@@ -128,13 +134,14 @@ export default function Game() {
       }
     });
 
-    socket.on('round_status', (status: { phase: 'lobby' | 'drawing' | 'results'; endsAt: number | null }) => {
+    socket.on('round_status', (status: { phase: 'lobby' | 'drawing' | 'results'; endsAt: number | null; promptText?: string | null }) => {
       phaseRef.current = status.phase;
       setPhase(status.phase);
       setEndsAt(status.endsAt);
+      setPromptText(status.promptText ?? null);
     });
 
-    socket.on('round_started', (round: { endsAt: number }) => {
+    socket.on('round_started', (round: { endsAt: number; promptText?: string | null }) => {
       phaseRef.current = 'drawing';
       setPhase('drawing');
       setEndsAt(round.endsAt);
@@ -143,6 +150,28 @@ export default function Game() {
       setLeftVotes(0);
       setRightVotes(0);
       setVotesCast(0);
+      setPromptText(round.promptText ?? null);
+      setLeftScore(null);
+      setRightScore(null);
+      setLeftReasoning(null);
+      setRightReasoning(null);
+      setAiError(null);
+    });
+
+    // The server asks for final canvas exports when the drawing timer ends;
+    // only the two drawers have anything to submit.
+    socket.on('request_drawings', () => {
+      const side = playerSideRef.current;
+      if (side !== 'left' && side !== 'right') return;
+      const canvas = side === 'left' ? canvasLeftRef.current : canvasRightRef.current;
+      if (!canvas || !roomIdRef.current) return;
+      try {
+        const dataUrl = canvas.toDataURL('image/png');
+        const imageBase64 = dataUrl.replace(/^data:image\/png;base64,/, '');
+        socket.emit('submit_drawing', { room: roomIdRef.current, side, imageBase64 });
+      } catch (error) {
+        console.warn('Failed to export canvas for scoring', error);
+      }
     });
 
     socket.on('round_timer', (timer: { remainingMs: number }) => {
@@ -151,7 +180,16 @@ export default function Game() {
 
     socket.on('vote_status', (status: { votesCast: number }) => setVotesCast(status.votesCast));
 
-    socket.on('round_ended', (result: { winner: 'left' | 'right' | 'tie'; leftVotes: number; rightVotes: number }) => {
+    socket.on('round_ended', (result: {
+      winner: 'left' | 'right' | 'tie';
+      leftVotes: number;
+      rightVotes: number;
+      leftScore?: number | null;
+      rightScore?: number | null;
+      leftReasoning?: string | null;
+      rightReasoning?: string | null;
+      aiError?: string | null;
+    }) => {
       phaseRef.current = 'results';
       setPhase('results');
       setEndsAt(null);
@@ -159,6 +197,11 @@ export default function Game() {
       setWinner(result.winner);
       setLeftVotes(result.leftVotes);
       setRightVotes(result.rightVotes);
+      setLeftScore(result.leftScore ?? null);
+      setRightScore(result.rightScore ?? null);
+      setLeftReasoning(result.leftReasoning ?? null);
+      setRightReasoning(result.rightReasoning ?? null);
+      setAiError(result.aiError ?? null);
     });
 
     socket.on('round_reset', () => {
@@ -170,6 +213,12 @@ export default function Game() {
       setLeftVotes(0);
       setRightVotes(0);
       setVotesCast(0);
+      setPromptText(null);
+      setLeftScore(null);
+      setRightScore(null);
+      setLeftReasoning(null);
+      setRightReasoning(null);
+      setAiError(null);
     });
 
     socket.on('player_side_assigned', (side: 'left' | 'right') => {
@@ -489,7 +538,7 @@ export default function Game() {
           {/* Drawing Prompt */}
           <h1 className="absolute inset-x-0 top-1/2 transform -translate-y-1/2 text-center z-10 select-none pointer-events-none">
             <span className="inline-block border border-black px-3 py-2 bg-[#345421] text-white text-3xl font-bold">
-              {selectedWord}
+              {promptText ?? 'Waiting for prompt…'}
             </span>
           </h1>
 
@@ -503,9 +552,25 @@ export default function Game() {
 
           {phase === 'results' && (
             <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/60 text-center text-white">
-              <div className="rounded border border-gray-500 bg-[#1a1a1a] p-8">
+              <div className="max-w-3xl rounded border border-gray-500 bg-[#1a1a1a] p-8">
                 <p className="text-sm uppercase text-gray-400">Round winner</p>
                 <p className="mt-2 text-3xl font-bold">{winner === 'tie' ? 'It’s a tie!' : `${winner?.toUpperCase()} wins!`}</p>
+
+                {/* AI judging is shown to everyone in the room, drawers included. */}
+                <div className="mt-6 grid grid-cols-2 gap-4 text-left">
+                  <div className="rounded border border-blue-700 p-3">
+                    <p className="text-xs uppercase text-gray-400">Left · AI score</p>
+                    <p className="text-2xl font-bold text-blue-300">{leftScore ?? '—'}</p>
+                    <p className="mt-2 text-sm text-gray-200">{leftReasoning ?? 'No AI reasoning available.'}</p>
+                  </div>
+                  <div className="rounded border border-red-700 p-3">
+                    <p className="text-xs uppercase text-gray-400">Right · AI score</p>
+                    <p className="text-2xl font-bold text-red-300">{rightScore ?? '—'}</p>
+                    <p className="mt-2 text-sm text-gray-200">{rightReasoning ?? 'No AI reasoning available.'}</p>
+                  </div>
+                </div>
+
+                {aiError && <p className="mt-4 text-xs text-yellow-400">AI judging issue — {aiError}</p>}
               </div>
             </div>
           )}

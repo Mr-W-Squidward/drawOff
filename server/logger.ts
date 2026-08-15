@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LOG_DIR = join(__dirname, 'logs');
 const SECURITY_LOG = join(LOG_DIR, 'security.log');
+const SCORING_LOG = join(LOG_DIR, 'scoring.log');
 
 export type SecuritySeverity = 'info' | 'warn' | 'alert';
 
@@ -58,4 +59,60 @@ export function logSecurityEvent(evt: SecurityEvent): void {
     void ensureLogDir()
         .then(() => appendFile(SECURITY_LOG, line + '\n', 'utf8'))
         .catch((err) => console.error('[SECURITY] failed to write log file:', err));
+}
+
+/**
+ * Outcome of one `scoreDrawing` invocation (mirrors `ScoreResult` in
+ * `server/scoring.ts`). Duplicated here rather than imported so this logger
+ * has no dependency on the scoring module.
+ */
+export interface ScoreResult {
+    score: number;
+    reasoning: string | null;
+    error: 'invalid_image' | 'api_error' | 'malformed_response' | null;
+    raw: string | null;
+}
+
+export interface ScoringDebugEvent {
+    roomId: string;
+    /** Omitted when the caller has no side context (e.g. the dev harness). */
+    side?: 'left' | 'right' | undefined;
+    promptText: string;
+    /** Request metadata only (e.g. model, image size/format) - never the full base64 image. */
+    requestPayloadSummary: Record<string, unknown>;
+    rawResponse: string | null;
+    parsedResult: ScoreResult;
+}
+
+/**
+ * Record raw AI scoring request/response data for prompt tuning.
+ *
+ * No-ops entirely unless `DEBUG_SCORING=true`, since this is high-volume and
+ * debug-only rather than security-relevant. Writes to its own log stream
+ * (`scoring.log`), separate from `security.log`. Fire-and-forget, same as
+ * `logSecurityEvent`: logging failures must never take down a caller.
+ *
+ * Full base64 image data must never be written here - only a size/format
+ * summary should be included in `requestPayloadSummary` if image info is
+ * needed at all.
+ */
+export function logScoringDebug(evt: ScoringDebugEvent): void {
+    if (process.env.DEBUG_SCORING !== 'true') return;
+
+    const record = {
+        ts: new Date().toISOString(),
+        roomId: evt.roomId,
+        side: evt.side,
+        promptText: evt.promptText,
+        requestPayloadSummary: evt.requestPayloadSummary,
+        rawResponse: evt.rawResponse,
+        parsedResult: evt.parsedResult,
+    };
+
+    const line = JSON.stringify(record);
+
+    // Persist to disk without blocking the caller.
+    void ensureLogDir()
+        .then(() => appendFile(SCORING_LOG, line + '\n', 'utf8'))
+        .catch((err) => console.error('[SCORING] failed to write log file:', err));
 }

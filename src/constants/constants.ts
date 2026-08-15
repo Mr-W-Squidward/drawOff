@@ -4,7 +4,9 @@ const wordList = ["Bunny", "Sunflower", "Lavender Roses", "Glasses", "Sudoku",
 
 function chooseRandomWord(words: string[]): string {
   const randomNumber = Math.floor(Math.random() * words.length)
-  return words[randomNumber];
+  // Indexed access is narrowed defensively so this helper is safe to reuse
+  // from the server (which typechecks with noUncheckedIndexedAccess).
+  return words[randomNumber] ?? words[0] ?? '';
 } 
 
 const TUTORIAL = [

@@ -6,8 +6,10 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { randomUUID } from 'node:crypto';
 import type { Stroke } from '../src/types/canvas.types.js';
+import wordList, { chooseRandomWord } from '../src/constants/constants.js';
 import { db, initDb } from './db.js';
 import { logSecurityEvent } from './logger.js';
+import { scoreDrawing, validateImage, type ScoreResult } from './scoring.js';
 import {
     SocketRateLimiter,
     sanitizeClientId,
@@ -69,7 +71,10 @@ const io = new Server(server, {
         origin: ALLOWED_ORIGINS,
         methods: ['GET', 'POST'],
     },
-    maxHttpBufferSize: 1e6, // 1 MB cap on any single socket message.
+    // 6 MB cap on any single socket message. Raised from the 1 MB default so
+    // the 5 MB decoded-image limit enforced by validateImage() is actually
+    // reachable over the wire once base64 (~4/3 inflation) is accounted for.
+    maxHttpBufferSize: 6 * 1024 * 1024,
 });
 
 // Per-socket event rate limits (token bucket). "draw" is high-frequency during
@@ -80,6 +85,10 @@ const socketLimiter = new SocketRateLimiter({
     start_round: { ratePerSec: 1, burst: 3 },
     cast_vote: { ratePerSec: 5, burst: 10 },
     draw: { ratePerSec: 120, burst: 240 },
+    // Same tier as `draw`. Only the first accepted submission per side per
+    // round triggers a Gemini call, so the cost/abuse vector is bounded by the
+    // handler's dedup guard rather than by this bucket.
+    submit_drawing: { ratePerSec: 120, burst: 240 },
     undo: { ratePerSec: 10, burst: 20 },
     redo: { ratePerSec: 10, burst: 20 },
     default: { ratePerSec: 20, burst: 40 },
@@ -103,6 +112,19 @@ function allowSocketEvent(socket: Socket, event: string): boolean {
 const ROOM_CAPACITY = 5;
 const ROUND_DURATION_MS = 60_000;
 const RESULT_DISPLAY_MS = 5_000;
+/**
+ * Bounded window, opened when the drawing timer fires, for both canvas
+ * snapshots to arrive AND both AI scoring calls to resolve. The round resolves
+ * early once both scores are in, and unconditionally when this expires, so a
+ * missing submission or a hung API call can never stall a room.
+ */
+const AI_SCORING_WINDOW_MS = 10_000;
+/**
+ * Voter key used for the AI's single vote. Contains ':' deliberately: the
+ * clientId charset (`sanitizeClientId`) and Socket.IO ids are both
+ * `[A-Za-z0-9_-]` only, so no real voter key can ever collide with this one.
+ */
+const AI_VOTER_KEY = '__ai__:system';
 type RoomRole = 'left' | 'right' | 'judge';
 type RoundPhase = 'lobby' | 'drawing' | 'results';
 type Vote = 'left' | 'right';
@@ -122,6 +144,15 @@ interface RoomState {
     hasStarted: boolean;
     endTimer: NodeJS.Timeout | undefined;
     tickTimer: NodeJS.Timeout | undefined;
+    /** Server-selected prompt for the current round; never client-supplied. */
+    promptText: string | null;
+    /** Final canvas exports (raw base64 PNG), one per drawing side. */
+    drawingSnapshots: { left: string | null; right: string | null };
+    /** AI score per side; null until that side's scoring call resolves. */
+    scores: { left: ScoreResult | null; right: ScoreResult | null };
+    /** True between `request_drawings` and round resolution. */
+    scoringActive: boolean;
+    scoringTimer: NodeJS.Timeout | undefined;
 }
 
 const rooms = new Map<string, RoomState>();
@@ -153,6 +184,11 @@ function createRoom(roomId = `game_${randomUUID()}`): [string, RoomState] {
         hasStarted: false,
         endTimer: undefined,
         tickTimer: undefined,
+        promptText: null,
+        drawingSnapshots: { left: null, right: null },
+        scores: { left: null, right: null },
+        scoringActive: false,
+        scoringTimer: undefined,
     };
     rooms.set(roomId, room);
     return [roomId, room];
@@ -167,8 +203,10 @@ function roleForRoom(room: RoomState): RoomRole {
 function clearRoundTimers(room: RoomState) {
     if (room.endTimer) clearTimeout(room.endTimer);
     if (room.tickTimer) clearInterval(room.tickTimer);
+    if (room.scoringTimer) clearTimeout(room.scoringTimer);
     room.endTimer = undefined;
     room.tickTimer = undefined;
+    room.scoringTimer = undefined;
 }
 
 function emitRoomState(roomId: string, room: RoomState) {
@@ -178,11 +216,71 @@ function emitRoomState(roomId: string, room: RoomState) {
     });
 }
 
+/**
+ * Runs when the drawing timer fires. Closes drawing/voting, asks both drawers
+ * for their final canvas export, and arms the hard deadline that guarantees the
+ * round resolves even if nothing else arrives.
+ */
+function beginScoring(roomId: string, room: RoomState) {
+    if (room.phase !== 'drawing' || room.scoringActive) return;
+    clearRoundTimers(room);
+    // Nulling roundEndsAt closes the drawing and voting windows (both handlers
+    // already require a live roundEndsAt) while the phase stays 'drawing'.
+    room.roundEndsAt = null;
+    room.scoringActive = true;
+
+    const deadline = Date.now() + AI_SCORING_WINDOW_MS;
+    io.to(roomId).emit('request_drawings', { room: roomId, deadline });
+    room.scoringTimer = setTimeout(() => finishRound(roomId, room), AI_SCORING_WINDOW_MS);
+}
+
+/** Scores one side as soon as its snapshot arrives, independently of the other. */
+async function scoreSide(roomId: string, room: RoomState, side: Vote, imageBase64: string) {
+    const result = await scoreDrawing({
+        promptText: room.promptText ?? '',
+        drawingBase64: imageBase64,
+        playerId: `${roomId}:${side}`,
+        roomId,
+        side,
+    });
+
+    // The round may already have resolved (window expired) while we waited.
+    if (rooms.get(roomId) !== room || !room.scoringActive) return;
+    room.scores[side] = result;
+    // Early resolution: both scores are in, no need to wait out the window.
+    if (room.scores.left && room.scores.right) finishRound(roomId, room);
+}
+
+/** Short human-readable note of which side(s) fell back, or null if neither. */
+function describeAiError(room: RoomState): string | null {
+    const parts: string[] = [];
+    for (const side of ['left', 'right'] as const) {
+        const result = room.scores[side];
+        if (result === null) {
+            parts.push(`${side}: ${room.drawingSnapshots[side] === null ? 'no_submission' : 'not_scored'}`);
+        } else if (result.error !== null) {
+            parts.push(`${side}: ${result.error}`);
+        }
+    }
+    return parts.length > 0 ? parts.join(', ') : null;
+}
+
 function finishRound(roomId: string, room: RoomState) {
     if (room.phase !== 'drawing') return;
     clearRoundTimers(room);
+    room.scoringActive = false;
     room.phase = 'results';
     room.roundEndsAt = null;
+
+    // A side with no snapshot, or whose scoring call failed, scores 0.
+    const leftScore = room.scores.left?.score ?? 0;
+    const rightScore = room.scores.right?.score ?? 0;
+
+    // The AI casts exactly one vote, alongside any human judge votes, for the
+    // higher-scoring side. It abstains on an exact score tie rather than
+    // picking a side arbitrarily.
+    if (leftScore > rightScore) room.votes.set(AI_VOTER_KEY, 'left');
+    else if (rightScore > leftScore) room.votes.set(AI_VOTER_KEY, 'right');
 
     let leftVotes = 0;
     let rightVotes = 0;
@@ -190,9 +288,34 @@ function finishRound(roomId: string, room: RoomState) {
         if (vote === 'left') leftVotes += 1;
         else rightVotes += 1;
     }
-    const winner: Vote | 'tie' = leftVotes === rightVotes ? 'tie' : leftVotes > rightVotes ? 'left' : 'right';
+
+    // Tiebreak: because the AI votes like a judge, even splits are common
+    // (e.g. one judge voting left and the AI voting right). When the tally is
+    // even, the higher raw AI score decides; if those are equal too, it's a
+    // genuine tie. This also covers the 0-0 case (no judges, AI abstained).
+    const winner: Vote | 'tie' =
+        leftVotes === rightVotes
+            ? leftScore === rightScore
+                ? 'tie'
+                : leftScore > rightScore
+                    ? 'left'
+                    : 'right'
+            : leftVotes > rightVotes
+                ? 'left'
+                : 'right';
+
     const displayUntil = Date.now() + RESULT_DISPLAY_MS;
-    io.to(roomId).emit('round_ended', { winner, leftVotes, rightVotes, displayUntil });
+    io.to(roomId).emit('round_ended', {
+        winner,
+        leftVotes,
+        rightVotes,
+        displayUntil,
+        leftScore,
+        rightScore,
+        leftReasoning: room.scores.left?.reasoning ?? null,
+        rightReasoning: room.scores.right?.reasoning ?? null,
+        aiError: describeAiError(room),
+    });
 
     setTimeout(() => {
         if (rooms.get(roomId) !== room || room.phase !== 'results') return;
@@ -202,6 +325,9 @@ function finishRound(roomId: string, room: RoomState) {
         room.historyRight = [];
         room.indexLeft = -1;
         room.indexRight = -1;
+        room.promptText = null;
+        room.drawingSnapshots = { left: null, right: null };
+        room.scores = { left: null, right: null };
         io.to(roomId).emit('round_reset', { phase: room.phase });
         emitRoomState(roomId, room);
     }, RESULT_DISPLAY_MS);
@@ -219,14 +345,24 @@ function startRound(roomId: string, room: RoomState) {
     room.historyRight = [];
     room.indexLeft = -1;
     room.indexRight = -1;
+    room.scoringActive = false;
+    room.drawingSnapshots = { left: null, right: null };
+    room.scores = { left: null, right: null };
+    // The prompt is chosen server-side and broadcast, so both drawers always
+    // see the same word and the AI judge has one authoritative prompt.
+    room.promptText = chooseRandomWord(wordList);
     room.roundEndsAt = Date.now() + ROUND_DURATION_MS;
-    io.to(roomId).emit('round_started', { endsAt: room.roundEndsAt, durationMs: ROUND_DURATION_MS });
+    io.to(roomId).emit('round_started', {
+        endsAt: room.roundEndsAt,
+        durationMs: ROUND_DURATION_MS,
+        promptText: room.promptText,
+    });
     emitRoomState(roomId, room);
     room.tickTimer = setInterval(() => {
         if (room.phase !== 'drawing' || room.roundEndsAt === null) return;
         io.to(roomId).emit('round_timer', { endsAt: room.roundEndsAt, remainingMs: Math.max(0, room.roundEndsAt - Date.now()) });
     }, 1_000);
-    room.endTimer = setTimeout(() => finishRound(roomId, room), ROUND_DURATION_MS);
+    room.endTimer = setTimeout(() => beginScoring(roomId, room), ROUND_DURATION_MS);
     return true;
 }
 
@@ -285,6 +421,7 @@ function emitAssignment(socket: Socket, roomId: string, role: RoomRole, room: Ro
         phase: room.phase,
         endsAt: room.roundEndsAt,
         hasStarted: room.hasStarted,
+        promptText: room.promptText,
     });
     socket.emit('vote_status', {
         votesCast: room.votes.size,
@@ -412,6 +549,35 @@ io.on('connection', (socket) => {
             left: { history: roomState.historyLeft, index: roomState.indexLeft },
             right: { history: roomState.historyRight, index: roomState.indexRight },
         });
+    });
+
+    socket.on('submit_drawing', (data: { room: string; side: 'left' | 'right'; imageBase64: string }) => {
+        if (!allowSocketEvent(socket, 'submit_drawing')) return;
+        const cleanRoomId = sanitizeRoomId(data?.room);
+        if (!cleanRoomId) return;
+        if (data?.side !== 'left' && data?.side !== 'right') return;
+
+        const room = rooms.get(cleanRoomId);
+        if (!room || !room.scoringActive) return;
+        // A drawer may only submit for their own side.
+        if (room.members.get(socket.id) !== data.side) return;
+        // First submission per side wins; later ones can't force extra AI calls.
+        if (room.drawingSnapshots[data.side] !== null) return;
+
+        const imageBase64 = typeof data.imageBase64 === 'string' ? data.imageBase64 : '';
+        const validation = validateImage(imageBase64);
+        if (!validation.ok) {
+            // Treated exactly like a missing submission: that side scores 0.
+            logSecurityEvent({
+                event: 'invalid_input',
+                source: socket.id,
+                details: { socketEvent: 'submit_drawing', reason: validation.reason, side: data.side },
+            });
+            return;
+        }
+
+        room.drawingSnapshots[data.side] = imageBase64;
+        void scoreSide(cleanRoomId, room, data.side, imageBase64);
     });
 
     socket.on('redo', (data: { room: string }) => {
