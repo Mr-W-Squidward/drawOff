@@ -6,6 +6,7 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "check:gemini": "node --env-file=.env --loader ts-node/esm scripts/checkGemini.ts",
     "dev": "nodemon --exec \"node --env-file=.env --loader ts-node/esm\" index.ts"
   },
   "keywords": [],

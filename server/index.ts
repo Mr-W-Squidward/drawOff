@@ -71,9 +71,8 @@ const io = new Server(server, {
         origin: ALLOWED_ORIGINS,
         methods: ['GET', 'POST'],
     },
-    // 6 MB cap on any single socket message. Raised from the 1 MB default so
-    // the 5 MB decoded-image limit enforced by validateImage() is actually
-    // reachable over the wire once base64 (~4/3 inflation) is accounted for.
+    // Raised from the 1 MB default so validateImage()'s 5 MB decoded-image
+    // limit is actually reachable once base64 inflation is accounted for.
     maxHttpBufferSize: 6 * 1024 * 1024,
 });
 
@@ -85,9 +84,8 @@ const socketLimiter = new SocketRateLimiter({
     start_round: { ratePerSec: 1, burst: 3 },
     cast_vote: { ratePerSec: 5, burst: 10 },
     draw: { ratePerSec: 120, burst: 240 },
-    // Same tier as `draw`. Only the first accepted submission per side per
-    // round triggers a Gemini call, so the cost/abuse vector is bounded by the
-    // handler's dedup guard rather than by this bucket.
+    // Same tier as `draw`. Cost is bounded by the handler's one-submission-
+    // per-side guard, not by this bucket.
     submit_drawing: { ratePerSec: 120, burst: 240 },
     undo: { ratePerSec: 10, burst: 20 },
     redo: { ratePerSec: 10, burst: 20 },
@@ -113,16 +111,14 @@ const ROOM_CAPACITY = 5;
 const ROUND_DURATION_MS = 60_000;
 const RESULT_DISPLAY_MS = 5_000;
 /**
- * Bounded window, opened when the drawing timer fires, for both canvas
- * snapshots to arrive AND both AI scoring calls to resolve. The round resolves
- * early once both scores are in, and unconditionally when this expires, so a
- * missing submission or a hung API call can never stall a room.
+ * Window for both snapshots to arrive and both scoring calls to resolve. The
+ * round resolves early once both scores are in, and unconditionally when this
+ * expires, so a missing submission or hung API call can't stall a room.
  */
 const AI_SCORING_WINDOW_MS = 10_000;
 /**
- * Voter key used for the AI's single vote. Contains ':' deliberately: the
- * clientId charset (`sanitizeClientId`) and Socket.IO ids are both
- * `[A-Za-z0-9_-]` only, so no real voter key can ever collide with this one.
+ * Voter key for the AI's single vote. The ':' is what makes it collision-proof:
+ * clientIds (`sanitizeClientId`) and socket ids are `[A-Za-z0-9_-]` only.
  */
 const AI_VOTER_KEY = '__ai__:system';
 type RoomRole = 'left' | 'right' | 'judge';
@@ -137,9 +133,8 @@ interface RoomState {
     indexRight: number;
     phase: RoundPhase;
     roundEndsAt: number | null;
-    /** Keyed by the reconnect-stable clientId (not socket.id) so a judge who
-     * reloads their tab is recognised as the same voter instead of getting a
-     * fresh vote slot under their new socket. */
+    /** Keyed by clientId, not socket.id, so a judge who reloads their tab is
+     * still the same voter rather than getting a fresh vote slot. */
     votes: Map<string, Vote>;
     hasStarted: boolean;
     endTimer: NodeJS.Timeout | undefined;
@@ -157,9 +152,8 @@ interface RoomState {
 
 const rooms = new Map<string, RoomState>();
 const socketRooms = new Map<string, string>();
-// Maps the live socket.id to the browser-persisted clientId supplied on
-// join, so events on this connection (e.g. cast_vote) can be attributed to
-// a stable identity that survives a page reload.
+// socket.id -> the clientId sent on join, so events on this connection can be
+// attributed to an identity that survives a page reload.
 const socketClientIds = new Map<string, string>();
 
 // Socket.IO handlers may be async and adapters can make room operations async.
@@ -217,15 +211,15 @@ function emitRoomState(roomId: string, room: RoomState) {
 }
 
 /**
- * Runs when the drawing timer fires. Closes drawing/voting, asks both drawers
- * for their final canvas export, and arms the hard deadline that guarantees the
- * round resolves even if nothing else arrives.
+ * Runs when the drawing timer fires: closes drawing and voting, asks both
+ * drawers for their final canvas export, and arms the deadline that resolves
+ * the round even if nothing else arrives.
  */
 function beginScoring(roomId: string, room: RoomState) {
     if (room.phase !== 'drawing' || room.scoringActive) return;
     clearRoundTimers(room);
-    // Nulling roundEndsAt closes the drawing and voting windows (both handlers
-    // already require a live roundEndsAt) while the phase stays 'drawing'.
+    // Nulling roundEndsAt is what closes the draw and vote windows - both
+    // handlers require a live one - while the phase stays 'drawing'.
     room.roundEndsAt = null;
     room.scoringActive = true;
 
@@ -276,9 +270,8 @@ function finishRound(roomId: string, room: RoomState) {
     const leftScore = room.scores.left?.score ?? 0;
     const rightScore = room.scores.right?.score ?? 0;
 
-    // The AI casts exactly one vote, alongside any human judge votes, for the
-    // higher-scoring side. It abstains on an exact score tie rather than
-    // picking a side arbitrarily.
+    // The AI casts one vote alongside the human judges, for the higher-scoring
+    // side. On an exact score tie it abstains rather than picking arbitrarily.
     if (leftScore > rightScore) room.votes.set(AI_VOTER_KEY, 'left');
     else if (rightScore > leftScore) room.votes.set(AI_VOTER_KEY, 'right');
 
@@ -289,10 +282,9 @@ function finishRound(roomId: string, room: RoomState) {
         else rightVotes += 1;
     }
 
-    // Tiebreak: because the AI votes like a judge, even splits are common
-    // (e.g. one judge voting left and the AI voting right). When the tally is
-    // even, the higher raw AI score decides; if those are equal too, it's a
-    // genuine tie. This also covers the 0-0 case (no judges, AI abstained).
+    // Tiebreak: the AI votes like a judge, so even splits are common (one judge
+    // left, AI right). On an even tally the higher raw AI score decides; equal
+    // there too is a genuine tie. Covers 0-0 as well (no judges, AI abstained).
     const winner: Vote | 'tie' =
         leftVotes === rightVotes
             ? leftScore === rightScore
@@ -348,8 +340,8 @@ function startRound(roomId: string, room: RoomState) {
     room.scoringActive = false;
     room.drawingSnapshots = { left: null, right: null };
     room.scores = { left: null, right: null };
-    // The prompt is chosen server-side and broadcast, so both drawers always
-    // see the same word and the AI judge has one authoritative prompt.
+    // Chosen here and broadcast, so both drawers see the same word and the AI
+    // judge scores against one authoritative prompt.
     room.promptText = chooseRandomWord(wordList);
     room.roundEndsAt = Date.now() + ROUND_DURATION_MS;
     io.to(roomId).emit('round_started', {
@@ -466,7 +458,7 @@ io.on('connection', (socket) => {
             typeof data === 'object' && data !== null ? (data as { clientId?: unknown }).clientId : undefined
         );
         await withAdmissionLock(async () => {
-            // Descending count deliberately fills 4/5 before 3/5, etc.
+            // Fullest room first, so 4/5 fills before 3/5.
             const candidate = [...rooms.entries()]
                 .filter(([, room]) => room.members.size < ROOM_CAPACITY)
                 .sort(([, a], [, b]) => b.members.size - a.members.size)[0];
@@ -500,9 +492,8 @@ io.on('connection', (socket) => {
         if (room.members.get(socket.id) !== 'judge') return;
         if (data.vote !== 'left' && data.vote !== 'right') return;
 
-        // Key by the reconnect-stable clientId (falling back to socket.id for
-        // clients that never sent one) so a judge who reloads and rejoins
-        // under a new socket.id still only ever holds one vote in this round.
+        // Key by clientId (falling back to socket.id for clients that never
+        // sent one) so reloading and rejoining doesn't buy a second vote.
         const voterKey = socketClientIds.get(socket.id) ?? socket.id;
         room.votes.set(voterKey, data.vote); // One current vote per judge; subsequent votes replace it.
         const votesCast = room.votes.size;

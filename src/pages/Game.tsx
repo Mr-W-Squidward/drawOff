@@ -4,6 +4,26 @@ import type { Stroke, CanvasState } from '../types/canvas.types';
 import { redrawCanvas } from '../utils/canvasUtils'
 import { useParams } from "react-router-dom";
 
+/** The canvas backgrounds are CSS classes, so the export has to repaint them. */
+const CANVAS_BACKGROUNDS = { left: '#123123', right: '#521312' } as const;
+
+/**
+ * Exports a canvas as a PNG data URL with `background` painted under the
+ * strokes. A bare `toDataURL()` sends the judge strokes on transparency, and a
+ * dark stroke on transparency-flattened-to-black is invisible.
+ */
+function exportCanvasWithBackground(canvas: HTMLCanvasElement, background: string): string {
+  const flattened = document.createElement('canvas');
+  flattened.width = canvas.width;
+  flattened.height = canvas.height;
+  const ctx = flattened.getContext('2d');
+  if (!ctx) return canvas.toDataURL('image/png');
+  ctx.fillStyle = background;
+  ctx.fillRect(0, 0, flattened.width, flattened.height);
+  ctx.drawImage(canvas, 0, 0);
+  return flattened.toDataURL('image/png');
+}
+
 export default function Game() {
   const { roomId: routeRoomId } = useParams<{ roomId?: string }>()
   const brushColourRef = useRef("black");
@@ -166,7 +186,7 @@ export default function Game() {
       const canvas = side === 'left' ? canvasLeftRef.current : canvasRightRef.current;
       if (!canvas || !roomIdRef.current) return;
       try {
-        const dataUrl = canvas.toDataURL('image/png');
+        const dataUrl = exportCanvasWithBackground(canvas, CANVAS_BACKGROUNDS[side]);
         const imageBase64 = dataUrl.replace(/^data:image\/png;base64,/, '');
         socket.emit('submit_drawing', { room: roomIdRef.current, side, imageBase64 });
       } catch (error) {

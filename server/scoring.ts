@@ -1,18 +1,15 @@
 /**
  * AI vision scoring service.
  *
- * Validates submitted drawing images and requests AI-generated scores from
- * the Google Gemini API (`@google/genai`). This module has no dependency on
- * Socket.IO or room state, so it can be unit/property tested in isolation and
- * reused by a dev-only scoring test harness script.
+ * Validates submitted drawing images and asks the Google Gemini API to score
+ * them. Knows nothing about Socket.IO or room state.
  *
- * All validators are defensive: they assume input is hostile (untrusted
- * client-supplied base64), cap work to prevent memory-exhaustion, and never
- * trust client-supplied types.
+ * Image input is untrusted client-supplied base64, so the validators assume
+ * hostile input: cap sizes, check magic bytes, trust no client-supplied type.
  */
 
 import { GoogleGenAI, Type } from '@google/genai';
-import { logScoringDebug } from './logger.js';
+import { logScoringDebug, logSecurityEvent } from './logger.js';
 
 // ---------------------------------------------------------------------------
 // Image validation
@@ -21,12 +18,7 @@ import { logScoringDebug } from './logger.js';
 /** Decoded-image size ceiling: 5MB (5 * 1024 * 1024 bytes). */
 const MAX_DECODED_BYTES = 5_242_880;
 
-/**
- * Base64 encoding inflates size by ~4/3. Reject strings whose *encoded*
- * length alone already implies a decoded size over the limit before paying
- * the cost of base64-decoding a potentially huge hostile payload into a
- * Buffer.
- */
+/** Same ceiling expressed in encoded chars (base64 inflates size by ~4/3). */
 const MAX_ENCODED_CHARS = Math.ceil((MAX_DECODED_BYTES * 4) / 3) + 4;
 
 /** PNG signature: 89 50 4E 47 0D 0A 1A 0A. */
@@ -48,23 +40,16 @@ export type ValidateImageResult =
     | { ok: false; reason: string };
 
 /**
- * Validates a base64-encoded drawing image before it is ever forwarded to
- * the Gemini API:
- *  - rejects payloads whose decoded size exceeds 5,242,880 bytes (5MB)
- *  - accepts only images whose magic bytes match the PNG or JPEG signature
- *
- * Never throws. Treats non-string/empty input the same as an unsupported
- * format, since a hostile or malformed `submit_drawing` payload should be
- * rejected rather than crash the caller.
+ * Checks size and magic bytes before an image is ever forwarded to Gemini.
+ * Never throws: empty or non-string input is reported as an unsupported
+ * format so a malformed `submit_drawing` payload can't crash the caller.
  */
 export function validateImage(drawingBase64: string): ValidateImageResult {
     if (typeof drawingBase64 !== 'string' || drawingBase64.length === 0) {
         return { ok: false, reason: 'unsupported_format' };
     }
 
-    // Fast reject of grossly oversized payloads before decoding, so a
-    // hostile multi-hundred-MB string can't force a large allocation just
-    // to be told "too large".
+    // Reject before decoding, so a huge string can't force a huge allocation.
     if (drawingBase64.length > MAX_ENCODED_CHARS) {
         return { ok: false, reason: 'too_large' };
     }
@@ -94,8 +79,11 @@ export function validateImage(drawingBase64: string): ValidateImageResult {
 // Gemini configuration
 // ---------------------------------------------------------------------------
 
-/** Model id is env-driven so it can be swapped without a code change. */
-const SCORING_MODEL = process.env.SCORING_MODEL ?? 'gemini-2.5-flash';
+/**
+ * Env-driven so the model can be swapped without a code change. The default
+ * has to be a currently-served id; a retired one makes every call 404.
+ */
+const SCORING_MODEL = process.env.SCORING_MODEL ?? 'gemini-3.5-flash-lite';
 
 /** Per-attempt wall-clock ceiling. A retry gets its own fresh budget. */
 const API_TIMEOUT_MS = 10_000;
@@ -103,8 +91,8 @@ const API_TIMEOUT_MS = 10_000;
 /** Fixed delay before the single network/rate-limit retry. */
 const RETRY_DELAY_MS = 2_000;
 
-/** Output cap: the response is a tiny JSON object, so this is generous. */
-const MAX_OUTPUT_TOKENS = 300;
+/** Generous: thinking tokens share this budget, so a tight cap returns empty text. */
+const MAX_OUTPUT_TOKENS = 1_024;
 
 const SYSTEM_PROMPT = [
     'You are a strict judge for a drawing game. You will be shown one player\'s',
@@ -117,9 +105,9 @@ const SYSTEM_PROMPT = [
 ].join('\n');
 
 /**
- * Constructed once at module load. Wrapped in try/catch so a missing or
- * malformed `GEMINI_API_KEY` degrades to "every scoring call fails with
- * api_error" instead of crashing the game server at import time.
+ * Built once at module load. A missing or malformed `GEMINI_API_KEY` leaves
+ * this null, so scoring fails with `api_error` instead of taking the game
+ * server down at import time.
  */
 const genai: GoogleGenAI | null = (() => {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -156,26 +144,23 @@ export interface ScoreResult {
     raw: string | null;
 }
 
-export interface GeminiRequestArgs {
+interface GeminiRequestArgs {
     promptText: string;
     drawingBase64: string;
     mimeType: 'image/png' | 'image/jpeg';
     timeoutMs: number;
 }
 
-/** Resolves to the model's raw text response, or rejects on any failure. */
-export type GeminiRequestFn = (args: GeminiRequestArgs) => Promise<string>;
-
 function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
- * Single Gemini `generateContent` call: the image as an inline-data part plus
- * the prompt text, a system instruction, and a response schema that forces
- * the JSON shape we parse. Aborts (and rejects) after `timeoutMs`.
+ * One Gemini `generateContent` call: the image as an inline-data part, the
+ * prompt text, a system instruction, and a response schema that pins the JSON
+ * shape we parse. Aborts (and rejects) after `timeoutMs`.
  */
-async function defaultGeminiRequest(args: GeminiRequestArgs): Promise<string> {
+async function geminiRequest(args: GeminiRequestArgs): Promise<string> {
     if (!genai) throw new Error('GEMINI_API_KEY is not configured');
 
     const controller = new AbortController();
@@ -196,27 +181,31 @@ async function defaultGeminiRequest(args: GeminiRequestArgs): Promise<string> {
                 abortSignal: controller.signal,
                 systemInstruction: SYSTEM_PROMPT,
                 maxOutputTokens: MAX_OUTPUT_TOKENS,
-                // Structured output: ask the API itself to guarantee the JSON
-                // shape rather than relying on prompt-only coercion.
+                // Let the API guarantee the JSON shape instead of relying on
+                // the prompt. The 0-100 range is left to clampScore() so the
+                // schema only uses fields the endpoint definitely accepts.
                 responseMimeType: 'application/json',
                 responseSchema: {
                     type: Type.OBJECT,
                     properties: {
-                        score: { type: Type.INTEGER, minimum: 0, maximum: 100 },
+                        score: { type: Type.INTEGER },
                         reasoning: { type: Type.STRING },
                     },
                     required: ['score', 'reasoning'],
                     propertyOrdering: ['score', 'reasoning'],
                 },
-                // gemini-2.5-* models spend output tokens on thinking by
-                // default, which can starve a small maxOutputTokens budget.
-                thinkingConfig: { thinkingBudget: 0 },
             },
         });
 
         const text = response.text;
         if (typeof text !== 'string' || text.trim().length === 0) {
-            throw new Error('empty response from model');
+            // An empty answer is nearly always MAX_TOKENS or a safety block,
+            // so carry the finish reason and usage into the logged message.
+            throw new Error(
+                'empty response from model' +
+                ` (finishReason=${String(response.candidates?.[0]?.finishReason)},` +
+                ` usage=${JSON.stringify(response.usageMetadata ?? null)})`
+            );
         }
         return text;
     } finally {
@@ -224,14 +213,72 @@ async function defaultGeminiRequest(args: GeminiRequestArgs): Promise<string> {
     }
 }
 
-let requestFn: GeminiRequestFn = defaultGeminiRequest;
+// ---------------------------------------------------------------------------
+// Failure diagnostics
+// ---------------------------------------------------------------------------
+
+/** Cap on how much raw model text / error text is ever copied into a log. */
+const LOG_TEXT_LIMIT = 500;
+
+/** Which call in the retry sequence produced the failure being logged. */
+type ScoringStage = 'initial' | 'retry' | 'reparse_retry';
+
+interface ScoringLogContext {
+    roomId: string;
+    side?: 'left' | 'right' | undefined;
+    playerId: string;
+}
+
+function truncate(text: string, limit: number = LOG_TEXT_LIMIT): string {
+    return text.length <= limit ? text : `${text.slice(0, limit)}...[truncated]`;
+}
 
 /**
- * Replace the underlying Gemini request function (for tests / the dev
- * harness). Pass `null` to restore the real implementation.
+ * Flattens a failed request into a loggable shape. Field by field rather than
+ * a blanket stringify, so nothing unexpected (an echoed request payload, say)
+ * ends up in the log.
  */
-export function setGeminiRequestFn(fn: GeminiRequestFn | null): void {
-    requestFn = fn ?? defaultGeminiRequest;
+function describeError(error: unknown): Record<string, unknown> {
+    if (typeof error !== 'object' || error === null) {
+        return { message: truncate(String(error)) };
+    }
+    const { name, message, status, code, statusText, response } = error as Record<string, unknown>;
+    const details: Record<string, unknown> = {};
+    if (typeof name === 'string') details.errorName = name;
+    if (typeof message === 'string') details.message = truncate(message);
+    if (typeof status === 'number' || typeof status === 'string') details.status = status;
+    if (typeof code === 'number' || typeof code === 'string') details.code = code;
+    if (typeof statusText === 'string') details.statusText = statusText;
+    if (response !== undefined) {
+        try {
+            details.response = truncate(
+                typeof response === 'string' ? response : JSON.stringify(response)
+            );
+        } catch {
+            details.response = '[unserializable]';
+        }
+    }
+    return details;
+}
+
+/**
+ * Records a failed Gemini request. Not gated behind `DEBUG_SCORING`: this is
+ * the only signal that AI scoring is broken, and with it hidden a total API
+ * outage looks like an honest `score: 0` on both sides.
+ */
+function logScoringApiError(context: ScoringLogContext, stage: ScoringStage, error: unknown): void {
+    logSecurityEvent({
+        event: 'scoring_api_error',
+        severity: 'warn',
+        source: context.roomId,
+        details: {
+            stage,
+            model: SCORING_MODEL,
+            playerId: context.playerId,
+            side: context.side,
+            ...describeError(error),
+        },
+    });
 }
 
 /** Strips ```json ... ``` fences that models sometimes add anyway. */
@@ -249,10 +296,10 @@ function clampScore(value: number): number {
     return Math.min(100, Math.max(0, Math.round(value)));
 }
 
+/** Backstop for the prompt's "under 50 words" - the model can ignore it. */
 function truncateWords(text: string, maxWords: number): string {
     const words = text.trim().split(/\s+/);
-    if (words.length <= maxWords) return text.trim();
-    return words.slice(0, maxWords).join(' ');
+    return words.length <= maxWords ? text.trim() : words.slice(0, maxWords).join(' ');
 }
 
 /** Parses the model text into a score/reasoning pair, or null if unusable. */
@@ -274,22 +321,25 @@ function parseModelText(raw: string): { score: number; reasoning: string } | nul
 }
 
 /**
- * Retry policy A - network error / timeout / rate limit: one attempt, a fixed
- * 2s wait, then exactly one more attempt. Any thrown error is treated as
- * retryable, since the failure modes we care about (timeout, transient
- * network, 429) are indistinguishable enough at this layer that a single
- * extra attempt is always the right response.
+ * Retry policy A - network error, timeout or rate limit: one attempt, a fixed
+ * 2s wait, then one more. Every thrown error is treated as retryable; at this
+ * layer the cases worth distinguishing all warrant the same single retry.
  */
-async function callWithRetry(args: GeminiRequestArgs): Promise<string | null> {
+async function callWithRetry(
+    args: GeminiRequestArgs,
+    context: ScoringLogContext
+): Promise<string | null> {
     try {
-        return await requestFn(args);
-    } catch {
-        // fall through to the single retry
+        return await geminiRequest(args);
+    } catch (error) {
+        // Swallowed for control flow, but never silently.
+        logScoringApiError(context, 'initial', error);
     }
     await delay(RETRY_DELAY_MS);
     try {
-        return await requestFn(args);
-    } catch {
+        return await geminiRequest(args);
+    } catch (error) {
+        logScoringApiError(context, 'retry', error);
         return null;
     }
 }
@@ -323,7 +373,13 @@ export async function scoreDrawing(request: ScoreRequest): Promise<ScoreResult> 
         timeoutMs: API_TIMEOUT_MS,
     };
 
-    const raw = await callWithRetry(args);
+    const logContext: ScoringLogContext = {
+        roomId: request.roomId ?? request.playerId,
+        side: request.side,
+        playerId: request.playerId,
+    };
+
+    const raw = await callWithRetry(args, logContext);
     if (raw === null) {
         return finish(request, { score: 0, reasoning: null, error: 'api_error', raw: null }, summary);
     }
@@ -334,12 +390,13 @@ export async function scoreDrawing(request: ScoreRequest): Promise<ScoreResult> 
     }
 
     // Retry policy B - the response arrived but isn't the JSON we expect.
-    // Re-parsing identical text can't help, so issue exactly ONE fresh
-    // generation (no further sub-retries) and parse that instead.
+    // Re-parsing the same text can't help, so ask for one fresh generation
+    // (no further sub-retries) and parse that instead.
     let retryRaw: string | null = null;
     try {
-        retryRaw = await requestFn(args);
-    } catch {
+        retryRaw = await geminiRequest(args);
+    } catch (error) {
+        logScoringApiError(logContext, 'reparse_retry', error);
         retryRaw = null;
     }
     const retryParsed = retryRaw === null ? null : parseModelText(retryRaw);
@@ -350,6 +407,20 @@ export async function scoreDrawing(request: ScoreRequest): Promise<ScoreResult> 
             summary
         );
     }
+
+    // Also logged unconditionally, with the offending text truncated.
+    logSecurityEvent({
+        event: 'scoring_malformed_response',
+        severity: 'warn',
+        source: logContext.roomId,
+        details: {
+            model: SCORING_MODEL,
+            playerId: logContext.playerId,
+            side: logContext.side,
+            firstAttemptText: truncate(raw),
+            retryText: retryRaw === null ? null : truncate(retryRaw),
+        },
+    });
 
     return finish(
         request,
