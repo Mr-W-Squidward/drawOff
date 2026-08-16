@@ -1,5 +1,8 @@
 import express from 'express';
 import { createServer } from 'node:http';
+import { dirname, join, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { Server, type Socket } from 'socket.io';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -192,6 +195,25 @@ function roleForRoom(room: RoomState): RoomRole {
     if (![...room.members.values()].includes('left')) return 'left';
     if (![...room.members.values()].includes('right')) return 'right';
     return 'judge';
+}
+
+/**
+ * Per-side tally of the human judges' votes, for the live in-round display.
+ * `AI_VOTER_KEY` is skipped explicitly: today the AI vote is only written in
+ * `finishRound` (after the voting window closes) so it can't be present here,
+ * but excluding it means the live counters still can't leak the AI's pick if
+ * the voting window is ever widened into the scoring phase.
+ * `finishRound` does its own tally that intentionally *includes* the AI vote.
+ */
+function tallyJudgeVotes(room: RoomState): { leftVotes: number; rightVotes: number } {
+    let leftVotes = 0;
+    let rightVotes = 0;
+    for (const [voterKey, vote] of room.votes) {
+        if (voterKey === AI_VOTER_KEY) continue;
+        if (vote === 'left') leftVotes += 1;
+        else if (vote === 'right') rightVotes += 1;
+    }
+    return { leftVotes, rightVotes };
 }
 
 function clearRoundTimers(room: RoomState) {
@@ -418,6 +440,7 @@ function emitAssignment(socket: Socket, roomId: string, role: RoomRole, room: Ro
     socket.emit('vote_status', {
         votesCast: room.votes.size,
         eligibleVoters: [...room.members.values()].filter((memberRole) => memberRole === 'judge').length,
+        ...tallyJudgeVotes(room),
     });
 }
 
@@ -497,7 +520,11 @@ io.on('connection', (socket) => {
         const voterKey = socketClientIds.get(socket.id) ?? socket.id;
         room.votes.set(voterKey, data.vote); // One current vote per judge; subsequent votes replace it.
         const votesCast = room.votes.size;
-        io.to(cleanRoomId).emit('vote_status', { votesCast, eligibleVoters: [...room.members.values()].filter((role) => role === 'judge').length });
+        io.to(cleanRoomId).emit('vote_status', {
+            votesCast,
+            eligibleVoters: [...room.members.values()].filter((role) => role === 'judge').length,
+            ...tallyJudgeVotes(room),
+        });
     });
 
     socket.on('draw', (data: { room: string; drawStroke: Stroke; side: 'left' | 'right' }) => {
@@ -839,6 +866,38 @@ router.get("/api/stats", async (req, res) => {
 
 app.use(router);
 
+// ---------------------------------------------------------------------------
+// Static frontend (single-origin deployment)
+//
+// In production this process also serves Vite's build output, so the app, the
+// stats API and Socket.IO all share one origin. Mounted after the API router
+// and before the catch-all 404 so unknown /api routes keep returning JSON.
+// The path is derived from this module's own location rather than
+// process.cwd(), which is not guaranteed at deploy time.
+// ---------------------------------------------------------------------------
+const moduleDir = dirname(fileURLToPath(import.meta.url));
+// `rootDir` is ".." (server code imports shared modules from ../src), so the
+// compiled entry is <repo>/server/dist/server/index.js - three levels below the
+// repo root, where Vite writes <repo>/dist. Running the TypeScript directly in
+// dev puts this module at <repo>/server, so the same relative walk lands
+// outside the repo and the existsSync guard below leaves static serving off -
+// which is what we want, since Vite serves the frontend itself in dev.
+const clientDir = resolve(moduleDir, '../../../dist');
+const clientIndexHtml = join(clientDir, 'index.html');
+const staticFrontendEnabled = existsSync(clientIndexHtml);
+
+if (staticFrontendEnabled) {
+    app.use(express.static(clientDir));
+    // SPA fallback: client-side routes (/game/:roomId, ...) must return the
+    // shell. GET-only and never /api/*, so unknown API routes and non-GET
+    // requests still fall through to the JSON 404 below. /socket.io/* never
+    // reaches Express - Socket.IO intercepts it on the shared HTTP server.
+    app.use((req, res, next) => {
+        if (req.method !== 'GET' || req.path.startsWith('/api/')) return next();
+        res.sendFile(clientIndexHtml);
+    });
+}
+
 // Unknown routes: log and return a generic 404 (no route enumeration hints).
 app.use((req, res) => {
     logSecurityEvent({
@@ -865,7 +924,15 @@ app.use((err: unknown, req: express.Request, res: express.Response, _next: expre
 (async () => {
     try {
         await initDb();
-        server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+        server.listen(PORT, () => {
+            console.log(`Server running on port ${PORT}`);
+            // First thing to check if a deploy serves a blank page.
+            console.log(
+                staticFrontendEnabled
+                    ? `Serving static frontend from ${clientDir}`
+                    : `Static frontend disabled (no index.html at ${clientIndexHtml}); API and websockets only`
+            );
+        });
     } catch (err) {
         console.error("Failed to initialize DB:", err);
         process.exit(1);

@@ -6,6 +6,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/server/index.js",
     "check:gemini": "node --env-file=.env --loader ts-node/esm scripts/checkGemini.ts",
     "dev": "nodemon --exec \"node --env-file=.env --loader ts-node/esm\" index.ts"
   },
@@ -13,8 +15,12 @@
   "author": "",
   "license": "ISC",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@google/genai": "2.17.1",
+    "@libsql/client": "^0.17.4",
     "cors": "^2.8.5",
     "express": "^5.2.1",
     "express-rate-limit": "^8.6.0",

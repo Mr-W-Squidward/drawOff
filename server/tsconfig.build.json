@@ -1,0 +1,14 @@
+{
+  // Production build config. The base tsconfig.json is noEmit (it exists for
+  // `npm run typecheck` and the ts-node dev loader); this one actually emits.
+  // rootDir is ".." in the base config because server code imports shared
+  // modules from ../src, so output lands as dist/server/*.js + dist/src/*.js.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "./dist",
+    // A runtime app never consumes its own .d.ts files; skipping them is faster.
+    "declaration": false,
+    "declarationMap": false
+  }
+}

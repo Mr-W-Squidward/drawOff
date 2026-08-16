@@ -18,11 +18,12 @@
     "module": "nodenext",
     "target": "esnext",
     "noEmit": true,
-    "types": [],
+    // Server code relies on Node globals (`process`, `Buffer`,
+    // `NodeJS.Timeout`) and the `node:*` builtin modules, so @types/node must
+    // be in scope for both typecheck and the production build.
+    "types": ["node"],
     // For nodejs:
     // "lib": ["esnext"],
-    // "types": ["node"],
-    // and npm install -D @types/node
 
     // Other Outputs
     "sourceMap": true,

@@ -8,6 +8,8 @@
     "dev:frontend": "vite",
     "dev:socket": "npm --prefix server run dev",
     "build": "tsc -b && vite build",
+    "build:server": "npm --prefix server run build",
+    "build:all": "npm run build && npm run build:server",
     "lint": "eslint .",
     "preview": "vite preview"
   },

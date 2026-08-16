@@ -130,7 +130,13 @@ export default function Game() {
 
   // Drawing with SOCKET.IO
   useEffect(() => {
-    const socket = io('http://localhost:5174');
+    // In production the frontend is served by the same Express process that
+    // hosts Socket.IO, so `io()` with no URL (same origin) is correct. In dev
+    // the app runs on Vite's 5173 while the server listens on 5174, so an
+    // explicit URL is required there. VITE_SERVER_URL overrides both.
+    const serverUrl =
+      import.meta.env.VITE_SERVER_URL ?? (import.meta.env.DEV ? 'http://localhost:5174' : undefined);
+    const socket = serverUrl ? io(serverUrl) : io();
     socketRef.current = socket;
 
     socket.on('connect', () => {
@@ -198,7 +204,13 @@ export default function Game() {
       setSecondsRemaining(Math.max(0, Math.ceil(timer.remainingMs / 1000)));
     });
 
-    socket.on('vote_status', (status: { votesCast: number }) => setVotesCast(status.votesCast));
+    // Broadcast on every accepted vote, so the per-canvas counters tick live
+    // for everyone in the room (drawers included), not just at round end.
+    socket.on('vote_status', (status: { votesCast: number; leftVotes: number; rightVotes: number }) => {
+      setVotesCast(status.votesCast);
+      setLeftVotes(status.leftVotes);
+      setRightVotes(status.rightVotes);
+    });
 
     socket.on('round_ended', (result: {
       winner: 'left' | 'right' | 'tie';
