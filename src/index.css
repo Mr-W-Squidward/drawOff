@@ -13,3 +13,35 @@
         }
     }
 }
+body { margin: 0; }
+.game-shell { min-height: 100dvh; background: #101522; color: #edf1fa; padding: 20px; font-family: system-ui, sans-serif; }
+.game-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.game-header a { font-size: 22px; font-weight: 800; }
+.room-code { font-size: 13px; overflow-wrap: anywhere; max-width: 280px; color: #b4c2dd; }
+.game-prompt { text-align: center; }
+.game-prompt span { text-transform: uppercase; font-size: 12px; color: #aebfe2; letter-spacing: 2px; }
+.game-prompt h1 { font-size: clamp(20px, 3vw, 32px); font-weight: 750; }
+.game-clock { font-size: 28px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.game-clock small { display: block; font-size: 13px; }
+.game-notice { padding: 16px 0; color: #cbd6ed; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.game-shell button { min-height: 44px; padding: 8px 16px; border: 1px solid #53617c; border-radius: 8px; background: #26324a; cursor: pointer; }
+.game-shell button[aria-pressed=true] { background: #425fba; border-color: #afc2ff; }
+.game-shell button:disabled { opacity: .45; cursor: default; }
+.drawing-tools { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+.drawing-tools label { display: flex; align-items: center; gap: 8px; min-height: 44px; }
+.drawing-tools input[type=color] { width: 44px; height: 44px; }
+.drawing-tools input[type=range] { width: 100px; }
+.drawing-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.drawing-card { border: 2px solid #3a465e; border-radius: 12px; overflow: hidden; min-width: 0; }
+.my-canvas { border-color: #90aaff; }
+.canvas-heading { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; min-height: 60px; }
+.canvas-heading h2 { font-weight: 650; }
+.drawing-card canvas { display: block; width: 100%; aspect-ratio: 4 / 3; background: #fff; }
+.game-footer { padding: 12px 0; color: #b4c2dd; }
+@media (max-width: 700px) {
+  .game-shell { padding: 12px; }
+  .game-header { flex-wrap: wrap; gap: 10px; }
+  .game-prompt { order: 3; width: 100%; text-align: left; }
+  .drawing-grid { grid-template-columns: 1fr; }
+  .my-canvas { order: -1; }
+}

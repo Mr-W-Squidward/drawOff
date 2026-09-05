@@ -5,7 +5,7 @@ const wordList = ["Bunny", "Sunflower", "Lavender Roses", "Glasses", "Sudoku",
 function chooseRandomWord(words: string[]): string {
   const randomNumber = Math.floor(Math.random() * words.length)
   return words[randomNumber];
-} 
+}
 
 const TUTORIAL = [
     {
@@ -30,5 +30,6 @@ const TUTORIAL = [
     }
 ]
 
-export default wordList; TUTORIAL; 
+export default wordList;
+export { TUTORIAL };
 export { chooseRandomWord };

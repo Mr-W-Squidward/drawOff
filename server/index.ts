@@ -100,13 +100,20 @@ function allowSocketEvent(socket: Socket, event: string): boolean {
 }
 
 const ROOM_CAPACITY = 5;
-const ROUND_DURATION_MS = 60_000;
-const RESULT_DISPLAY_MS = 5_000;
+const ROUND_DURATION_MS = process.env.NODE_ENV === 'test' ? 1500 : 60_000;
+const RESULT_DISPLAY_MS = process.env.NODE_ENV === 'test' ? 500 : 5_000;
 type RoomRole = 'left' | 'right' | 'judge';
-type RoundPhase = 'lobby' | 'drawing' | 'results';
+type RoundPhase = 'lobby' | 'drawing' | 'voting' | 'results';
+const PROMPTS = ['Bunny', 'Birthday Cake', 'Bear', 'Bird', 'Galaxy', 'Sunflower', 'A robot on holiday', 'A castle in the clouds'];
+const VOTING_DURATION_MS = process.env.NODE_ENV === 'test' ? 1000 : 15_000;
+const RECONNECT_MS = 60_000;
+const identities = new Map<string, string>();
+const reservations = new Map<string, ReturnType<typeof setTimeout>>();
 type Vote = 'left' | 'right';
 
 interface RoomState {
+    prompt: string | null;
+    result: { winner: Vote | 'tie'; leftVotes: number; rightVotes: number; displayUntil: number } | null;
     members: Map<string, RoomRole>;
     historyLeft: Stroke[];
     historyRight: Stroke[];
@@ -134,6 +141,8 @@ function withAdmissionLock<T>(operation: () => Promise<T> | T): Promise<T> {
 
 function createRoom(roomId = `game_${randomUUID()}`): [string, RoomState] {
     const room: RoomState = {
+        prompt: null,
+        result: null,
         members: new Map(),
         historyLeft: [],
         historyRight: [],
@@ -171,7 +180,7 @@ function emitRoomState(roomId: string, room: RoomState) {
 }
 
 function finishRound(roomId: string, room: RoomState) {
-    if (room.phase !== 'drawing') return;
+    if (room.phase !== 'voting') return;
     clearRoundTimers(room);
     room.phase = 'results';
     room.roundEndsAt = null;
@@ -184,11 +193,16 @@ function finishRound(roomId: string, room: RoomState) {
     }
     const winner: Vote | 'tie' = leftVotes === rightVotes ? 'tie' : leftVotes > rightVotes ? 'left' : 'right';
     const displayUntil = Date.now() + RESULT_DISPLAY_MS;
-    io.to(roomId).emit('round_ended', { winner, leftVotes, rightVotes, displayUntil });
+    room.result = { winner, leftVotes, rightVotes, displayUntil };
+    room.roundEndsAt = displayUntil;
+    io.to(roomId).emit('round_ended', room.result);
 
-    setTimeout(() => {
+    room.endTimer = setTimeout(() => {
         if (rooms.get(roomId) !== room || room.phase !== 'results') return;
         room.phase = 'lobby';
+        room.prompt = null;
+        room.result = null;
+        room.roundEndsAt = null;
         room.votes.clear();
         room.historyLeft = [];
         room.historyRight = [];
@@ -200,11 +214,13 @@ function finishRound(roomId: string, room: RoomState) {
 }
 
 function startRound(roomId: string, room: RoomState) {
-    const roles = new Set(room.members.values());
+    const roles = new Set([...room.members].filter(([id]) => io.sockets.sockets.get(id)?.connected).map(([, role]) => role));
     if (room.phase !== 'lobby' || !roles.has('left') || !roles.has('right')) return false;
 
     clearRoundTimers(room);
     room.phase = 'drawing';
+    room.prompt = PROMPTS[Math.floor(Math.random() * PROMPTS.length)]!;
+    room.result = null;
     room.hasStarted = true;
     room.votes.clear();
     room.historyLeft = [];
@@ -212,13 +228,19 @@ function startRound(roomId: string, room: RoomState) {
     room.indexLeft = -1;
     room.indexRight = -1;
     room.roundEndsAt = Date.now() + ROUND_DURATION_MS;
-    io.to(roomId).emit('round_started', { endsAt: room.roundEndsAt, durationMs: ROUND_DURATION_MS });
+    io.to(roomId).emit('round_started', { endsAt: room.roundEndsAt, durationMs: ROUND_DURATION_MS, prompt: room.prompt });
     emitRoomState(roomId, room);
     room.tickTimer = setInterval(() => {
         if (room.phase !== 'drawing' || room.roundEndsAt === null) return;
         io.to(roomId).emit('round_timer', { endsAt: room.roundEndsAt, remainingMs: Math.max(0, room.roundEndsAt - Date.now()) });
     }, 1_000);
-    room.endTimer = setTimeout(() => finishRound(roomId, room), ROUND_DURATION_MS);
+    room.endTimer = setTimeout(() => {
+        clearRoundTimers(room);
+        room.phase = 'voting';
+        room.roundEndsAt = Date.now() + VOTING_DURATION_MS;
+        io.to(roomId).emit('round_status', { phase: room.phase, endsAt: room.roundEndsAt, prompt: room.prompt, result: null });
+        room.endTimer = setTimeout(() => finishRound(roomId, room), VOTING_DURATION_MS);
+    }, ROUND_DURATION_MS);
     return true;
 }
 
@@ -240,9 +262,28 @@ async function removeSocketFromRoom(socket: Socket) {
 
 async function admit(socket: Socket, roomId: string) {
     const room = rooms.get(roomId) ?? createRoom(roomId)[1];
+    const token = sanitizeSessionId(socket.handshake.auth?.sessionId);
+    const previousId = token ? identities.get(token) : undefined;
+    if (previousId && previousId !== socket.id && reservations.has(previousId) && socketRooms.get(previousId) === roomId) {
+        const previousRole = room.members.get(previousId);
+        clearTimeout(reservations.get(previousId));
+        reservations.delete(previousId);
+        socketRooms.delete(previousId);
+        room.members.delete(previousId);
+        if (previousRole) room.members.set(socket.id, previousRole);
+        const vote = room.votes.get(previousId);
+        room.votes.delete(previousId);
+        if (vote) room.votes.set(socket.id, vote);
+        socketRooms.set(socket.id, roomId);
+        await socket.join(roomId);
+    }
+    if (previousId && previousId !== socket.id && io.sockets.sockets.get(previousId)?.connected) {
+        return { ok: false as const, code: 'session_in_use' };
+    }
+    if (token) identities.set(token, socket.id);
     const existingRole = room.members.get(socket.id);
     if (existingRole) return { ok: true as const, roomId, role: existingRole, room };
-    if (room.members.size >= ROOM_CAPACITY) return { ok: false as const };
+    if (room.members.size >= ROOM_CAPACITY) return { ok: false as const, code: 'room_full' };
 
     await removeSocketFromRoom(socket);
     const role = roleForRoom(room);
@@ -274,6 +315,9 @@ function emitAssignment(socket: Socket, roomId: string, role: RoomRole, room: Ro
         phase: room.phase,
         endsAt: room.roundEndsAt,
         hasStarted: room.hasStarted,
+        prompt: room.prompt,
+        result: room.result,
+        vote: room.votes.get(socket.id) ?? null,
     });
     socket.emit('vote_status', {
         votesCast: room.votes.size,
@@ -299,7 +343,7 @@ io.on('connection', (socket) => {
         await withAdmissionLock(async () => {
             const result = await admit(socket, cleanRoomId);
             if (!result.ok) {
-                socket.emit('room_join_error', { code: 'room_full', roomId: cleanRoomId });
+                socket.emit('room_join_error', { code: result.code, roomId: cleanRoomId });
                 return;
             }
             emitAssignment(socket, result.roomId, result.role, result.room);
@@ -340,7 +384,7 @@ io.on('connection', (socket) => {
         const cleanRoomId = sanitizeRoomId(data?.room);
         if (!cleanRoomId) return;
         const room = rooms.get(cleanRoomId);
-        if (!room || room.phase !== 'drawing' || room.roundEndsAt === null || Date.now() >= room.roundEndsAt) return;
+        if (!room || room.phase !== 'voting' || room.roundEndsAt === null || Date.now() >= room.roundEndsAt) return;
         if (room.members.get(socket.id) !== 'judge') return;
         if (data.vote !== 'left' && data.vote !== 'right') return;
 
@@ -370,6 +414,7 @@ io.on('connection', (socket) => {
         const role = roomState.members.get(socket.id);
         if (role !== data.side) return;
 
+        if (roomState.historyLeft.length + roomState.historyRight.length >= 2000) return;
         if (data.side === 'left') {
             roomState.historyLeft = roomState.historyLeft.slice(0, roomState.indexLeft + 1);
             roomState.historyLeft.push(stroke);
@@ -397,7 +442,7 @@ io.on('connection', (socket) => {
         if (!cleanRoomId) return;
         const roomState = rooms.get(cleanRoomId);
         if (!roomState) return;
-        if (roomState.phase !== 'drawing') return;
+        if (roomState.phase !== 'drawing' || roomState.roundEndsAt === null || Date.now() >= roomState.roundEndsAt) return;
 
         const side = roomState.members.get(socket.id);
         if (side !== 'left' && side !== 'right') return;
@@ -422,7 +467,7 @@ io.on('connection', (socket) => {
         if (!cleanRoomId) return;
         const roomState = rooms.get(cleanRoomId);
         if (!roomState) return;
-        if (roomState.phase !== 'drawing') return;
+        if (roomState.phase !== 'drawing' || roomState.roundEndsAt === null || Date.now() >= roomState.roundEndsAt) return;
 
         const side = roomState.members.get(socket.id);
         if (side !== 'left' && side !== 'right') return;
@@ -444,7 +489,14 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         console.log(`User ${socket.id} disconnected.`)
         socketLimiter.clear(socket.id);
-        void withAdmissionLock(() => removeSocketFromRoom(socket));
+        reservations.set(socket.id, setTimeout(() => {
+            void withAdmissionLock(async () => {
+                reservations.delete(socket.id);
+                await removeSocketFromRoom(socket);
+                const token = sanitizeSessionId(socket.handshake.auth?.sessionId);
+                if (token && identities.get(token) === socket.id) identities.delete(token);
+            });
+        }, RECONNECT_MS));
     });
 });
 
@@ -492,7 +544,7 @@ async function pruneInactive() {
         totalAdd += deltaSec;
     }
 
-    const batch: { sql: string; args?: any[] }[] = [];
+    const batch: { sql: string; args?: (string | number)[] }[] = [];
 
     if (totalAdd > 0) {
         batch.push({
@@ -632,7 +684,7 @@ router.post("/api/stats/session/end", async (req, res) => {
     const deltaSeconds = Math.max(0, Math.floor((now - lastSeen) / 1000));
 
     try {
-        const batch: { sql: string; args: any[] }[] = [];
+        const batch: { sql: string; args: (string | number)[] }[] = [];
         if (deltaSeconds > 0) {
             batch.push({
                 sql: `UPDATE stats SET total_playtime_seconds = total_playtime_seconds + ? WHERE id = ?`,
@@ -673,6 +725,7 @@ app.use((req, res) => {
 // Central error handler: log the real error server-side, return a generic
 // message to the client so stack traces / internals are never leaked.
 app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    void _next;
     logSecurityEvent({
         event: 'unhandled_error',
         severity: 'alert',

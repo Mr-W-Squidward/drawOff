@@ -9,7 +9,8 @@
     "dev:socket": "npm --prefix server run dev",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node tests/canvas.mjs && node tests/multiplayer.mjs"
   },
   "dependencies": {
     "@libsql/client": "^0.17.4",

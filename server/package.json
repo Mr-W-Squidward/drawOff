@@ -6,7 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "typecheck": "tsc --noEmit",
-    "dev": "nodemon --exec \"node --env-file=.env --loader ts-node/esm\" index.ts"
+    "dev": "nodemon --exec \"node --env-file-if-exists=.env --loader ts-node/esm\" index.ts"
   },
   "keywords": [],
   "author": "",

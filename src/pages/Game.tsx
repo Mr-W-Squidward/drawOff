@@ -1,535 +1,179 @@
-import { useRef, useEffect, useState, type RefObject } from "react";
+import { useEffect, useRef, useState } from 'react';
+import { Link, useParams } from 'react-router-dom';
 import { io, Socket } from 'socket.io-client';
-import type { Stroke, CanvasState } from '../types/canvas.types';
-import { redrawCanvas } from '../utils/canvasUtils'
-import wordList, { chooseRandomWord } from '../constants/constants'
-import { useParams } from "react-router-dom";
+import type { Stroke, Tool } from '../types/canvas.types';
+import { canvasPoint, redrawCanvas } from '../utils/canvasUtils';
+
+type Side = 'left' | 'right';
+type Phase = 'lobby' | 'drawing' | 'voting' | 'results';
+type Result = { winner: Side | 'tie'; leftVotes: number; rightVotes: number };
+type Status = { phase: Phase; endsAt: number | null; prompt: string | null; result: Result | null; vote?: Side | null };
+type History = { history: Stroke[]; index: number };
+const empty = (): History => ({ history: [], index: -1 });
 
 export default function Game() {
-  const { roomId: routeRoomId } = useParams<{ roomId?: string }>()
-  const brushColourRef = useRef("black");
-  const lineWidthRef = useRef(4);
-  const socketRef = useRef<Socket | null>(null);
-  const playerSideRef = useRef<'left' | 'right' | null>(null);
-  const canvasLeftRef = useRef<HTMLCanvasElement>(null);
-  const canvasRightRef = useRef<HTMLCanvasElement>(null);
-  const canvasStateLeftRef = useRef<CanvasState>({ history: [], historyIndex: -1, currentTool: 'brush' })
-  const canvasStateRightRef = useRef<CanvasState>({ history: [], historyIndex: -1, currentTool: 'brush' })
-  const phaseRef = useRef<'lobby' | 'drawing' | 'results'>('lobby');
-  const [phase, setPhase] = useState<'lobby' | 'drawing' | 'results'>('lobby');
-  const [endsAt, setEndsAt] = useState<number | null>(null);
-  const [secondsRemaining, setSecondsRemaining] = useState(60);
-  const [leftVotes, setLeftVotes] = useState(0);
-  const [rightVotes, setRightVotes] = useState(0);
-  const [winner, setWinner] = useState<'left' | 'right' | 'tie' | null>(null);
-  const [votesCast, setVotesCast] = useState(0);
-  const [showColourWheel, setShowColourWheel] = useState(false);
-  const [role, setRole] = useState<'left' | 'right' | 'judge' | null>(null);
-  const [, forceUpdate] = useState({});
-  const [roomId, setRoomId] = useState<string | null>(routeRoomId ?? null);
+  const { roomId: routeRoom } = useParams();
+  const [room, setRoom] = useState(routeRoom ?? '');
+  const roomRef = useRef(routeRoom ?? sessionStorage.getItem('drawoff-room') ?? '');
+  const [role, setRole] = useState<Side | 'judge' | null>(null);
+  const [connected, setConnected] = useState(false);
+  const [error, setError] = useState('');
+  const [status, setStatus] = useState<Status>({ phase: 'lobby', endsAt: null, prompt: null, result: null });
+  const [seconds, setSeconds] = useState(0);
+  const [vote, setVote] = useState<Side | null>(null);
+  const [votes, setVotes] = useState(0);
+  const [colour, setColour] = useState('#172033');
+  const [width, setWidth] = useState(6);
+  const [tool, setTool] = useState<Tool>('brush');
+  const socket = useRef<Socket | null>(null);
+  const canvases = useRef<Record<Side, HTMLCanvasElement | null>>({ left: null, right: null });
+  const histories = useRef<Record<Side, History>>({ left: empty(), right: empty() });
+  const active = useRef<{ side: Side; pointer: number; stroke: Stroke } | null>(null);
+  const canDraw = connected && status.phase === 'drawing' && (role === 'left' || role === 'right');
 
-  function undoStroke(canvasRef: RefObject<HTMLCanvasElement | null>, stateRef: RefObject<CanvasState>) {
-    if (!canvasRef.current) return;
-    if (stateRef.current.historyIndex >= 0) {
-        stateRef.current.historyIndex--;
-        redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex)
-        
-        if (socketRef.current && roomIdRef.current) {
-          socketRef.current.emit('undo', { room: roomIdRef.current });
-        }
-
-        forceUpdate({});
+  function paint(side: Side) {
+    const canvas = canvases.current[side];
+    const h = histories.current[side];
+    if (canvas) {
+      const strokes = h.history.slice(0, h.index + 1);
+      if (active.current?.side === side) strokes.push(active.current.stroke);
+      redrawCanvas(canvas, strokes, strokes.length - 1);
     }
   }
 
-  function redoStroke(canvasRef: RefObject<HTMLCanvasElement | null>, stateRef: RefObject<CanvasState>) {
-    if (!canvasRef.current) return;
-    if (stateRef.current.historyIndex + 1 < stateRef.current.history.length) {
-      stateRef.current.historyIndex++;
-      redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex)
-      
-      if (socketRef.current && roomIdRef.current) {
-        socketRef.current.emit('redo', { room: roomIdRef.current });
-      }
-
-      forceUpdate({});
-    } 
-  }
-
-  function changeColour(brushColour: string) {
-    brushColourRef.current = brushColour;
-    setShowColourWheel(false);
-  }
-
-  function handleColourWheelChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const colour = e.target.value;
-    brushColourRef.current = colour;
-  }
-
-  function startRound() {
-    if ((role === 'left' || role === 'right') && roomIdRef.current) {
-      socketRef.current?.emit('start_round', { room: roomIdRef.current });
+  useEffect(() => {
+    let sessionId = sessionStorage.getItem('drawoff-session');
+    if (!sessionId) {
+      sessionId = Array.from(crypto.getRandomValues(new Uint8Array(24)), byte => byte.toString(16).padStart(2, '0')).join('');
+      sessionStorage.setItem('drawoff-session', sessionId);
     }
-  }
-
-  function castVote(vote: 'left' | 'right') {
-    if (role === 'judge' && phaseRef.current === 'drawing' && roomIdRef.current) {
-      socketRef.current?.emit('cast_vote', { room: roomIdRef.current, vote });
-    }
-  }
-  
-  
-  // Canvas drawing refs -> add line width / colour wheel / socket.io later
-  const [selectedWord] = useState(() => chooseRandomWord(wordList));
-  const roomIdRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    if (phase !== 'drawing' || endsAt === null) return;
-    const updateTimer = () => setSecondsRemaining(Math.max(0, Math.ceil((endsAt - Date.now()) / 1000)));
-    updateTimer();
-    const timer = window.setInterval(updateTimer, 250);
-    return () => window.clearInterval(timer);
-  }, [phase, endsAt]);
-
-  // Drawing with SOCKET.IO
-  useEffect(() => {
-    const socket = io('http://localhost:5174');
-    socketRef.current = socket;
-
-    socket.on('connect', () => {
-      if (routeRoomId) {
-        roomIdRef.current = routeRoomId;
-        setRoomId(routeRoomId);
-        socket.emit('join_room', routeRoomId);
-      } else {
-        socket.emit('find_match');
-      }
+    const client = io({ auth: { sessionId } });
+    socket.current = client;
+    client.on('connect', () => {
+      setError('');
+      if (roomRef.current) client.emit('join_room', roomRef.current);
+      else client.emit('find_match');
     });
-
-    socket.on('room_assigned', (assignment: { roomId: string; role: 'left' | 'right' | 'judge' }) => {
-      roomIdRef.current = assignment.roomId;
-      setRoomId(assignment.roomId);
-      setRole(assignment.role);
-      if (assignment.role === 'judge') {
-        playerSideRef.current = null;
-      } else {
-        playerSideRef.current = assignment.role;
-      }
+    client.on('room_assigned', (data: { roomId: string; role: Side | 'judge' }) => {
+      roomRef.current = data.roomId;
+      sessionStorage.setItem('drawoff-room', data.roomId);
+      setRoom(data.roomId);
+      setRole(data.role);
+      setConnected(true);
     });
-
-    socket.on('round_status', (status: { phase: 'lobby' | 'drawing' | 'results'; endsAt: number | null }) => {
-      phaseRef.current = status.phase;
-      setPhase(status.phase);
-      setEndsAt(status.endsAt);
+    client.on('room_join_error', (data: { code: string }) => {
+      setConnected(false);
+      setError(data.code === 'room_full' ? 'This room is full. Try another room.' : data.code === 'session_in_use' ? 'This seat is open in another tab. Open a fresh tab from the home page to join as another player.' : 'That room code is invalid.');
     });
-
-    socket.on('round_started', (round: { endsAt: number }) => {
-      phaseRef.current = 'drawing';
-      setPhase('drawing');
-      setEndsAt(round.endsAt);
-      setSecondsRemaining(60);
-      setWinner(null);
-      setLeftVotes(0);
-      setRightVotes(0);
-      setVotesCast(0);
+    client.on('round_status', (data: Status) => {
+      active.current = null;
+      setStatus(data);
+      setVote(data.vote ?? null);
+      paint('left'); paint('right');
     });
-
-    socket.on('round_timer', (timer: { remainingMs: number }) => {
-      setSecondsRemaining(Math.max(0, Math.ceil(timer.remainingMs / 1000)));
+    client.on('round_started', (data: { endsAt: number; prompt: string }) => {
+      active.current = null;
+      setStatus({ phase: 'drawing', endsAt: data.endsAt, prompt: data.prompt, result: null });
+      setVote(null); setVotes(0);
     });
-
-    socket.on('vote_status', (status: { votesCast: number }) => setVotesCast(status.votesCast));
-
-    socket.on('round_ended', (result: { winner: 'left' | 'right' | 'tie'; leftVotes: number; rightVotes: number }) => {
-      phaseRef.current = 'results';
-      setPhase('results');
-      setEndsAt(null);
-      setSecondsRemaining(0);
-      setWinner(result.winner);
-      setLeftVotes(result.leftVotes);
-      setRightVotes(result.rightVotes);
+    client.on('round_ended', (data: Result & { displayUntil: number }) => {
+      active.current = null;
+      setStatus(old => ({ ...old, phase: 'results', endsAt: data.displayUntil, result: data }));
     });
-
-    socket.on('round_reset', () => {
-      phaseRef.current = 'lobby';
-      setPhase('lobby');
-      setEndsAt(null);
-      setSecondsRemaining(60);
-      setWinner(null);
-      setLeftVotes(0);
-      setRightVotes(0);
-      setVotesCast(0);
+    client.on('round_reset', () => {
+      active.current = null;
+      setStatus({ phase: 'lobby', endsAt: null, prompt: null, result: null });
+      setVote(null); setVotes(0);
     });
-
-    socket.on('player_side_assigned', (side: 'left' | 'right') => {
-      console.log('🎯 player_side_assigned received:', side);
-      playerSideRef.current = side;
-      setRole(side);
-      forceUpdate({});
+    client.on('vote_status', (data: { votesCast: number }) => setVotes(data.votesCast));
+    client.on('room_state', (data: Record<Side, History>) => {
+      histories.current = data;
+      paint('left'); paint('right');
     });
-
-    socket.on('opponent_draw', (data: {side: 'left' | 'right'; stroke: Stroke }) => {
-      console.log('🎨 opponent_draw received, player side:', playerSideRef.current);
-      const stateRef = data.side === 'left' ? canvasStateLeftRef : canvasStateRightRef;
-      const canvasRef = data.side === 'left' ? canvasLeftRef : canvasRightRef;
-
-      // STROKE goes to OPPONENT'S history
-      stateRef.current.history = stateRef.current.history.slice(0, stateRef.current.historyIndex+1);
-      stateRef.current.history.push(data.stroke);
-      stateRef.current.historyIndex += 1;
-      
-      if (canvasRef.current) {
-        redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex);
-      }
-    });
-
-    socket.on('room_state', (data: { 
-      left: { history: Stroke[], index: number };
-      right: { history: Stroke[], index: number };
-    }) => {
-      
-      canvasStateLeftRef.current.history = data.left.history;
-      canvasStateLeftRef.current.historyIndex = data.left.index;
-
-      canvasStateRightRef.current.history = data.right.history;
-      canvasStateRightRef.current.historyIndex = data.right.index;
-
-      if (canvasLeftRef.current) {
-        redrawCanvas(canvasLeftRef.current, data.left.history, data.left.index);
-      };
-
-      if (canvasRightRef.current) {
-        redrawCanvas(canvasRightRef.current, data.right.history, data.right.index);
-      }
-    });
-
-    socket.on('disconnect', () => {
-      console.log('❌ Disconnected from server');
-    });
-
-    socket.on('connect_error', (error) => {
-      console.error('❌ Connection error:', error);
-    });
-
-    return () => {
-      // Reload persistence
-      localStorage.setItem('canvasStateLeft', JSON.stringify(canvasStateLeftRef.current));
-      localStorage.setItem('canvasStateRight', JSON.stringify(canvasStateRightRef.current));
-      socket.disconnect();
+    const offline = () => {
+      active.current = null;
+      setConnected(false);
+      paint('left'); paint('right');
     };
-  }, [routeRoomId]);
-  
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.ctrlKey || e.metaKey) {
-        if (phaseRef.current !== 'drawing') return;
-        if (e.key === 'z') {
-          e.preventDefault()
-          
-          if (playerSideRef.current === 'left') {
-            undoStroke(canvasLeftRef, canvasStateLeftRef);
-          } else {
-            undoStroke(canvasRightRef, canvasStateRightRef);
-          }
-        };
-
-        if (e.key === 'y') {
-          e.preventDefault()
-          if (playerSideRef.current === 'left') {
-            redoStroke(canvasLeftRef, canvasStateLeftRef);
-          } else {
-            redoStroke(canvasRightRef, canvasStateRightRef);
-          }
-        };
-      }
-    }
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, []);
-  
-  useEffect(() => {
-    const loadSavedState = (
-      key: string,
-      stateRef: RefObject<CanvasState>,
-      canvasRef: RefObject<HTMLCanvasElement | null>
-    ) => {
-      const stored = localStorage.getItem(key);
-      if (!stored) return;
-      try {
-        stateRef.current = JSON.parse(stored);
-        if (canvasRef.current) {
-          redrawCanvas(canvasRef.current, stateRef.current.history, stateRef.current.historyIndex)
-        }
-      } catch (error) {
-        console.warn('Failed to parse saved canvas state', key, error);
-      }
-    };
-
-    loadSavedState('canvasStateLeft', canvasStateLeftRef, canvasLeftRef);
-    loadSavedState('canvasStateRight', canvasStateRightRef, canvasRightRef);
-
-    const setupCanvas = (canvas: HTMLCanvasElement | null, stateRef: RefObject<CanvasState>) => {
-      if (!canvas) return () => {}
-      const ctx = canvas.getContext('2d');
-
-      const resizeCanvas = () => {
-        canvas.width = canvas.offsetWidth;
-        canvas.height = canvas.offsetHeight;
-
-        if (ctx) {
-          redrawCanvas(canvas, stateRef.current.history, stateRef.current.historyIndex)
-        }
-      };
-
-      resizeCanvas();
-
-      let rect = canvas.getBoundingClientRect();
-      const isDrawing = { current: false }
-      let currentStroke: Stroke | null = null;
-
-      const onMouseDown = (event: MouseEvent) => {
-        const isLeftCanvas = canvas.id === 'canvasLeft';
-        if (phaseRef.current !== 'drawing' || playerSideRef.current !== (isLeftCanvas ? 'left' : 'right')) {
-          return;
-        }
-
-        // Determine tool based on mouse button
-        const isRightClick = event.button === 2;
-        const toolToUse = isRightClick ? 'eraser' : 'brush';
-        
-        rect = canvas.getBoundingClientRect();
-        isDrawing.current = true;
-        if (!ctx) return;
-        
-        const x = event.clientX - rect.left;
-        const y = event.clientY - rect.top;
-        
-        currentStroke = {
-          type: toolToUse,
-          colour: brushColourRef.current,
-          width: lineWidthRef.current,
-          points: [{ x, y }]
-        };
-        
-        if (toolToUse === 'eraser') {
-          ctx.globalCompositeOperation = 'destination-out';
-          ctx.strokeStyle = canvas.id === 'canvasLeft' ? '#123123' : '#521312';
-        } else {
-          ctx.globalCompositeOperation = 'source-over';
-          ctx.strokeStyle = brushColourRef.current;
-        }
-        
-        ctx.lineWidth = lineWidthRef.current;
-        ctx.lineCap = 'round';
-        ctx.beginPath();
-        ctx.moveTo(x, y);
-      };
-
-      const onContextMenu = (event: MouseEvent) => {
-        event.preventDefault()
-      }
-
-      const onMouseMove = (event: MouseEvent) => {
-        if (!isDrawing.current || !ctx || !currentStroke) return;
-        
-        const x = event.clientX - rect.left;
-        const y = event.clientY - rect.top;
-        
-        currentStroke.points.push({ x, y });
-        ctx.lineTo(x, y);
-        ctx.stroke();
-      }
-
-      const stopDrawing = () => {
-        if (!isDrawing.current || !currentStroke) {
-          isDrawing.current = false;
-          return;
-        }
-        
-        isDrawing.current = false;
-
-        // Determine which canvas this is
-        const isLeftCanvas = canvas.id === 'canvasLeft';
-        const stateRef = isLeftCanvas ? canvasStateLeftRef : canvasStateRightRef;
-
-        // Remove any redo history (when drawn)
-        stateRef.current.history = stateRef.current.history.slice(0, stateRef.current.historyIndex+1);
-
-        // Add stroke to history
-        stateRef.current.history.push(currentStroke);
-        stateRef.current.historyIndex += 1;
-
-        localStorage.setItem(isLeftCanvas ? 'canvasStateLeft' : 'canvasStateRight', JSON.stringify(stateRef.current));
-
-        // Emit stroke to server only if this is the player's assigned canvas
-          if (playerSideRef.current === (isLeftCanvas ? 'left' : 'right') && socketRef.current && roomIdRef.current) {          
-            socketRef.current.emit('draw', {
-              room: roomIdRef.current,
-              drawStroke: currentStroke,
-              side: isLeftCanvas ? 'left' : 'right',
-          });
-        }
-
-        currentStroke = null;
-        
-      }
-      
-      canvas.addEventListener("mousedown", onMouseDown);
-      canvas.addEventListener("mousemove", onMouseMove);
-      canvas.addEventListener('mouseup', stopDrawing);
-      canvas.addEventListener('mouseleave', stopDrawing);
-      canvas.addEventListener('contextmenu', onContextMenu)
-      window.addEventListener('resize', resizeCanvas);
-
-      return () => {
-        canvas.removeEventListener("mousedown", onMouseDown);
-        canvas.removeEventListener("mousemove", onMouseMove);
-        canvas.removeEventListener('mouseup', stopDrawing);
-        canvas.removeEventListener('mouseleave', stopDrawing);
-        canvas.removeEventListener('contextmenu', onContextMenu)
-        window.removeEventListener('resize', resizeCanvas);
-      }
-    };
-
-    const cleanupLeft = setupCanvas(canvasLeftRef.current, canvasStateLeftRef);
-    const cleanupRight = setupCanvas(canvasRightRef.current, canvasStateRightRef);
-
-    return () => {
-      cleanupLeft();
-      cleanupRight();
-    };
+    client.on('disconnect', offline);
+    client.on('connect_error', offline);
+    return () => { client.disconnect(); };
   }, []);
 
-  return (
-    <>
-      <div className="w-full h-screen bg-[#000000] flex flex-col">
-        {/* Fixed Toolbar at Top */}
-        <header className="flex-shrink-0 bg-[#1a1a1a] border-b border-gray-700 p-4 z-30">
-          <div className="flex justify-between items-center">
-            {/* Player Info */}
-            <div className="text-white text-sm">
-              <div>Room: <span className="font-mono text-yellow-400">{roomId || 'Connecting...'}</span></div>
-              <div>Role: <span className={`font-bold ${role === 'left' ? 'text-blue-400' : role === 'right' ? 'text-red-400' : 'text-gray-400'}`}>
-                {role ? role.toUpperCase() : 'Waiting...'}
-              </span>
-              </div>
-            </div>
+  useEffect(() => {
+    const tick = () => setSeconds(status.endsAt ? Math.max(0, Math.ceil((status.endsAt - Date.now()) / 1000)) : 0);
+    tick();
+    const timer = window.setInterval(tick, 250);
+    return () => clearInterval(timer);
+  }, [status.endsAt]);
 
-            <div className="text-center text-white">
-              <div className="text-xs uppercase text-gray-400">{phase}</div>
-              <div className="font-mono text-2xl">{phase === 'drawing' ? `0:${secondsRemaining.toString().padStart(2, '0')}` : phase === 'results' ? 'Round complete' : 'Lobby'}</div>
-              {role === 'judge' && phase === 'drawing' && <div className="text-xs text-gray-400">Votes cast: {votesCast}</div>}
-            </div>
+  useEffect(() => {
+    const observer = new ResizeObserver(() => {
+      for (const side of ['left', 'right'] as const) {
+        const canvas = canvases.current[side];
+        if (!canvas) continue;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = Math.round(rect.width * window.devicePixelRatio);
+        canvas.height = Math.round(rect.height * window.devicePixelRatio);
+        paint(side);
+      }
+    });
+    for (const canvas of Object.values(canvases.current)) if (canvas) observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
 
-            <div className="flex justify-center items-center gap-6">
-              {/* Saved Colours */}
-              <div className="flex items-center justify-center gap-2 select-none pointer-events-auto">
-                <button className="w-8 h-8 bg-[#000000] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#000000")} title="Black"/>
-                <button className="w-8 h-8 bg-[#FF0000] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#FF0000")} title="Red"></button>
-                <button className="w-8 h-8 bg-[#0000FF] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#0000FF")} title="Blue"></button>
-                <button className="w-8 h-8 bg-[#00FF00] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#00FF00")} title="Green"></button>
-                <button className="w-8 h-8 bg-[#FFFF00] border border-gray-500 hover:border-white transition" onClick={() => changeColour("#FFFF00")} title="Yellow"></button>
-              </div>
+  function finish(cancel = false) {
+    const drawing = active.current;
+    active.current = null;
+    if (!drawing) return;
+    if (!cancel && canDraw && socket.current?.connected && seconds > 0) {
+      socket.current.emit('draw', { room: roomRef.current, side: drawing.side, drawStroke: drawing.stroke });
+    }
+    paint(drawing.side);
+  }
 
-            {/* Colour Wheel Picker */}
-            <div className="relative">
-              <button 
-                className="px-3 py-1 bg-gray-700 hover:bg-gray-600 border border-gray-500 text-white text-sm transition"
-                onClick={() => setShowColourWheel(!showColourWheel)}
-              >
-                Colour Wheel
-              </button>
-              {showColourWheel && (
-                <div className="absolute top-full mt-2 left-0 bg-[#2a2a2a] border border-gray-500 p-3 rounded z-40">
-                  <input 
-                    type="color" 
-                    defaultValue="black"
-                    onChange={handleColourWheelChange}
-                    className="w-16 h-16 cursor-pointer"
-                  />
-                </div>
-              )}
-            </div>
-
-            {/* Line Width Slider */}
-            <div className="flex items-center gap-2">
-              <label className="text-white text-sm">Line Width:</label>
-              <input
-                type="range"
-                min="1"
-                max="16"
-                step="1"
-                defaultValue={4}
-                onChange={(e) => {
-                  const v = Number((e.target as HTMLInputElement).value);
-                  lineWidthRef.current = v;
-                }}
-                className="w-32"
-              />
-              </div>
-            </div>
-          </div>
-        </header>
-
-        {/* Game Wrapper */}
-        <div className="relative flex-1 flex overflow-hidden">
-
-          {/* Drawing Prompt */}
-          <h1 className="absolute inset-x-0 top-1/2 transform -translate-y-1/2 text-center z-10 select-none pointer-events-none">
-            <span className="inline-block border border-black px-3 py-2 bg-[#345421] text-white text-3xl font-bold">
-              {selectedWord}
-            </span>
-          </h1>
-
-          {phase === 'lobby' && (
-            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/50">
-              {(role === 'left' || role === 'right') ? (
-                <button className="rounded bg-blue-600 px-6 py-3 font-bold text-white hover:bg-blue-500" onClick={startRound}>Start Round</button>
-              ) : <p className="rounded bg-[#1a1a1a] p-4 text-white">Waiting for the drawers to start the round…</p>}
-            </div>
-          )}
-
-          {phase === 'results' && (
-            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/60 text-center text-white">
-              <div className="rounded border border-gray-500 bg-[#1a1a1a] p-8">
-                <p className="text-sm uppercase text-gray-400">Round winner</p>
-                <p className="mt-2 text-3xl font-bold">{winner === 'tie' ? 'It’s a tie!' : `${winner?.toUpperCase()} wins!`}</p>
-              </div>
-            </div>
-          )}
-
-          {role === 'judge' && phase === 'drawing' && (
-            <div className="absolute bottom-4 left-1/2 z-20 flex -translate-x-1/2 gap-3 rounded bg-[#1a1a1a] p-3 text-white">
-              <button className="rounded bg-blue-700 px-4 py-2 hover:bg-blue-500" onClick={() => castVote('left')}>Vote Left</button>
-              <button className="rounded bg-red-700 px-4 py-2 hover:bg-red-500" onClick={() => castVote('right')}>Vote Right</button>
-            </div>
-          )}
-
-          {/* Canvas Wrapper */}
-          <div className="flex flex-1 relative">
-
-            <div className="relative w-1/2">
-              <canvas id="canvasLeft" className="w-full h-full bg-[#123123]" ref={canvasLeftRef}/>
-              {/* Left Vote Counter */}
-              <div className="absolute bottom-4 left-4 bg-[#1a1a1a] border-2 border-gray-500 px-3 py-2 text-white font-bold text-lg z-20">
-                <div className="text-xs text-gray-400">Votes</div>
-                <div className="text-2xl">{leftVotes}</div>
-              </div>
-            </div>
-
-            <div className="relative w-1/2">
-              <canvas id="canvasRight" className="w-full h-full bg-[#521312]" ref={canvasRightRef}/>
-              {/* Right Vote Counter */}
-              <div className="absolute bottom-4 right-4 bg-[#1a1a1a] border-2 border-gray-500 px-3 py-2 text-white font-bold text-lg z-20">
-                <div className="text-xs text-gray-400">Votes</div>
-                <div className="text-2xl">{rightVotes}</div>
-              </div>
-            </div>
-
-          </div>
+  return <main className="game-shell">
+    <header className="game-header">
+      <div><Link to="/">← drawOff</Link><p className="room-code">Room: {room.replace(/^game_/, '') || 'Finding a room…'}</p></div>
+      <div className="game-prompt"><span>{status.phase}</span><h1>{status.prompt ?? 'Ready for a drawOff?'}</h1></div>
+      <div className="game-clock">{status.endsAt ? `${seconds}s` : 'Lobby'}<small>{role ? `You: ${role}` : 'Joining…'}</small></div>
+    </header>
+    <div className="game-notice" role="status">
+      {error || (!connected ? 'Connecting… Your seat is held for 60 seconds after a disconnect.' : status.phase === 'lobby' ? 'Invite a friend using the room code. Two drawers are needed to start.' : status.phase === 'drawing' ? role === 'judge' ? 'Watch the drawings. Voting opens when the timer ends.' : 'Draw the prompt! Your work appears for everyone when you lift your finger.' : status.phase === 'voting' ? 'Time to judge! Choose your favourite drawing.' : `${status.result?.winner === 'tie' ? 'It’s a tie!' : `${status.result?.winner ?? ''} wins!`} · ${status.result?.leftVotes ?? 0}–${status.result?.rightVotes ?? 0}`)}
+      {connected && status.phase === 'lobby' && role !== 'judge' && <button onClick={() => socket.current?.emit('start_round', { room })}>Start round</button>}
+    </div>
+    {role !== 'judge' && <div className="drawing-tools">
+      <button aria-pressed={tool === 'brush'} onClick={() => setTool('brush')}>Brush</button>
+      <button aria-pressed={tool === 'eraser'} onClick={() => setTool('eraser')}>Eraser</button>
+      <label>Colour <input aria-label="Brush colour" type="color" value={colour} onChange={e => setColour(e.target.value)} /></label>
+      <label>Size <input aria-label="Brush size" type="range" min="2" max="40" value={width} onChange={e => setWidth(Number(e.target.value))} /></label>
+      <button disabled={!canDraw} onClick={() => socket.current?.emit('undo', { room })}>Undo</button>
+      <button disabled={!canDraw} onClick={() => socket.current?.emit('redo', { room })}>Redo</button>
+    </div>}
+    <section className="drawing-grid">
+      {(['left', 'right'] as const).map(side => <article key={side} className={`drawing-card ${role === side ? 'my-canvas' : ''}`}>
+        <div className="canvas-heading"><h2>{side === 'left' ? 'Left' : 'Right'} artist {role === side && '· You'}</h2>
+          {role === 'judge' && status.phase === 'voting' && <button disabled={!connected || seconds === 0} aria-pressed={vote === side} onClick={() => { if (socket.current?.connected) { socket.current.emit('cast_vote', { room, vote: side }); setVote(side); } }}>{vote === side ? '✓ Selected' : 'Vote'}</button>}
         </div>
-      </div>
-    </>
-  )
+        <canvas ref={el => { canvases.current[side] = el; }} aria-label={`${side} drawing canvas`} style={{ touchAction: role === side ? 'none' : 'pan-y' }}
+          onContextMenu={e => e.preventDefault()}
+          onPointerDown={e => {
+            if (!canDraw || role !== side || active.current || seconds === 0 || (e.button !== 0 && e.button !== 2)) return;
+            e.preventDefault();
+            e.currentTarget.setPointerCapture(e.pointerId);
+            active.current = { side, pointer: e.pointerId, stroke: { type: e.button === 2 ? 'eraser' : tool, colour, width, points: [canvasPoint(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect())] } };
+            paint(side);
+          }}
+          onPointerMove={e => {
+            const drawing = active.current;
+            if (!drawing || drawing.pointer !== e.pointerId || drawing.side !== side) return;
+            if (drawing.stroke.points.length < 5000) drawing.stroke.points.push(canvasPoint(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect()));
+            paint(side);
+          }}
+          onPointerUp={e => { if (active.current?.pointer === e.pointerId) finish(); }}
+          onPointerCancel={() => finish(true)} onLostPointerCapture={() => finish(true)} />
+      </article>)}
+    </section>
+    {status.phase === 'voting' && <p className="game-footer">{votes} judge vote{votes === 1 ? '' : 's'} cast. {role !== 'judge' && 'Drawers cannot vote.'}</p>}
+  </main>;
 }

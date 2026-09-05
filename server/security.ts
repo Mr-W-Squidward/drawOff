@@ -61,13 +61,14 @@ export function sanitizeStroke(value: unknown): Stroke | null {
     if (s.type !== 'brush' && s.type !== 'eraser') return null;
     if (typeof s.colour !== 'string' || !COLOUR_RE.test(s.colour)) return null;
     if (!isFiniteNumber(s.width) || s.width <= 0 || s.width > MAX_STROKE_WIDTH) return null;
-    if (!Array.isArray(s.points) || s.points.length > MAX_POINTS_PER_STROKE) return null;
+    if (!Array.isArray(s.points) || s.points.length === 0 || s.points.length > MAX_POINTS_PER_STROKE) return null;
 
     const points: Array<{ x: number; y: number }> = [];
     for (const p of s.points) {
         if (typeof p !== 'object' || p === null) return null;
         const pt = p as Record<string, unknown>;
         if (!isFiniteNumber(pt.x) || !isFiniteNumber(pt.y)) return null;
+        if (pt.x < 0 || pt.x > 1000 || pt.y < 0 || pt.y > 750) return null;
         points.push({ x: pt.x, y: pt.y });
     }
 
